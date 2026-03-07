@@ -1,0 +1,27 @@
+{
+  "id": "manus-bridge",
+  "name": "Manus Bridge",
+  "description": "Bridge OpenClaw conversations to the openclaw-manus task runtime.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "apiBaseUrl": {
+        "type": "string",
+        "description": "Base URL for the openclaw-manus API. Defaults to http://127.0.0.1:3000."
+      },
+      "pollIntervalMs": {
+        "type": "number",
+        "description": "Polling interval for task status updates."
+      },
+      "autoReplyOnCompletion": {
+        "type": "boolean",
+        "description": "Send completion and approval updates back to the original conversation."
+      },
+      "enableCommands": {
+        "type": "boolean",
+        "description": "Register /task, /task-status, and /approve-task commands."
+      }
+    }
+  }
+}

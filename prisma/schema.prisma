@@ -1,0 +1,173 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model TaskRecord {
+  id                 String             @id
+  userId             String
+  goal               String
+  status             String
+  createdAt          DateTime
+  updatedAt          DateTime
+  currentPlanVersion Int
+  planJson           String
+  originJson         String?
+  finalArtifactUri   String?
+  retryOfTaskId      String?
+  cancelRequestedAt  DateTime?
+  steps              TaskStepRecord[]
+  checkpoints        CheckpointRecord[]
+  artifacts          ArtifactRecord[]
+  toolCalls          ToolCallRecord[]
+  approvals          ApprovalRequestRecord[]
+  jobs               TaskJobRecord[]
+  events             TaskEventRecord[]
+  memories           MemoryRecordModel[]
+
+  @@index([userId])
+}
+
+model MemoryRecordModel {
+  id        String   @id
+  taskId    String
+  stepId    String?
+  summary   String
+  createdAt DateTime
+  task      TaskRecord @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@index([taskId, createdAt])
+}
+
+model TaskStepRecord {
+  key                String   @id
+  taskId             String
+  stepId             String
+  orderIndex         Int
+  title              String
+  agent              String
+  objective          String
+  dependsOnJson      String
+  status             String
+  retryCount         Int
+  successCriteriaJson String
+  summary            String?
+  inputArtifactsJson String
+  outputArtifactsJson String
+  structuredDataJson String
+  errorJson          String?
+  task               TaskRecord @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@unique([taskId, stepId])
+  @@index([taskId, orderIndex])
+}
+
+model CheckpointRecord {
+  id                 String   @id
+  taskId             String
+  planVersion        Int
+  completedStepsJson String
+  currentStepId      String?
+  artifactUrisJson   String
+  lastErrorJson      String?
+  createdAt          DateTime
+  task               TaskRecord @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@index([taskId, createdAt])
+}
+
+model ArtifactRecord {
+  id           String   @id
+  taskId       String
+  stepId       String?
+  type         String
+  uri          String
+  metadataJson String
+  createdAt    DateTime
+  task         TaskRecord @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@index([taskId, createdAt])
+}
+
+model UserProfileRecord {
+  userId          String   @id
+  language        String
+  outputStyle     String
+  riskPolicy      String
+  preferencesJson String
+  updatedAt       DateTime
+}
+
+model ToolCallRecord {
+  id         String   @id
+  taskId      String
+  stepId      String
+  toolName    String
+  action      String
+  callerAgent String
+  status      String
+  durationMs  Int
+  createdAt   DateTime
+  task        TaskRecord @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@index([taskId, createdAt])
+}
+
+model ApprovalRequestRecord {
+  id           String   @id
+  taskId       String
+  stepId       String
+  toolName     String
+  action       String
+  status       String
+  reason       String
+  payloadJson  String
+  requestedAt  DateTime
+  decidedAt    DateTime?
+  decidedBy    String?
+  decisionNote String?
+  task         TaskRecord @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@index([taskId, stepId, requestedAt])
+  @@index([status, requestedAt])
+}
+
+model TaskJobRecord {
+  id          String   @id
+  taskId      String
+  kind        String
+  status      String
+  payloadJson String
+  attempts    Int
+  maxAttempts Int
+  availableAt DateTime
+  createdAt   DateTime
+  updatedAt   DateTime
+  lockedAt    DateTime?
+  lockedBy    String?
+  lastError   String?
+  task        TaskRecord @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@index([taskId, createdAt])
+  @@index([status, availableAt, createdAt])
+}
+
+model TaskEventRecord {
+  id        String   @id
+  taskId     String
+  kind       String
+  level      String
+  message    String
+  stepId     String?
+  jobId      String?
+  payloadJson String
+  createdAt  DateTime
+  task       TaskRecord @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@index([taskId, createdAt])
+  @@index([kind, createdAt])
+}

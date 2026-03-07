@@ -1,0 +1,13 @@
+dist
+node_modules
+.env
+.env.local
+.data
+prisma/dev.db
+*.db
+*.sqlite
+*.sqlite3
+*.log
+.tmp-*
+screenshots/
+uploads/

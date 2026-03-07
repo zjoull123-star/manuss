@@ -1,0 +1,12 @@
+{
+  "name": "manus-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "OpenClaw bridge plugin for delegating long-running tasks to openclaw-manus.",
+  "openclaw": {
+    "extensions": [
+      "index.js"
+    ]
+  }
+}
