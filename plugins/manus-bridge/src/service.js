@@ -1,7 +1,10 @@
+import path from "node:path";
+
 function buildCompletionMessage(task) {
   const lines = [`任务 ${task.id} 已${task.status === "COMPLETED" ? "完成" : "结束"}.`, `状态: ${task.status}`];
   if (task.finalArtifactUri) {
-    lines.push(`产物: ${task.finalArtifactUri}`);
+    lines.push(`产物: ${path.basename(task.finalArtifactUri)}`);
+    lines.push("请在本地控制台或 API 中查看和下载最终交付物。");
   }
   return lines.join("\n");
 }

@@ -7,6 +7,7 @@ import { buildDemoRuntime, TaskQueueWorker } from "../src";
 import {
   AgentKind,
   ApprovalStatus,
+  ArtifactType,
   createTaskFromPlan,
   createTaskJob,
   StepStatus,
@@ -386,6 +387,94 @@ test("retry creates a rerun task with retryOfTaskId and enqueues prepare work", 
     ),
     true
   );
+});
+
+test("retry clones uploaded artifacts into the rerun task workspace", async () => {
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-manus-retry-upload-"));
+  const runtime = buildDemoRuntime(workspaceRoot, new ConsoleLogger(false));
+
+  const sourceTask = await runtime.orchestrator.createDraftTask({
+    userId: "user_retry_upload",
+    goal: "TASK: 分析上传的 csv 并生成报告"
+  });
+  const sourceUploadPath = path.join(workspaceRoot, sourceTask.id, "uploads", "numbers.csv");
+  await fs.mkdir(path.dirname(sourceUploadPath), { recursive: true });
+  await fs.writeFile(sourceUploadPath, "value\n12\n18\n", "utf8");
+  await runtime.artifactRepository.save({
+    id: "artifact_upload_source",
+    taskId: sourceTask.id,
+    type: ArtifactType.Spreadsheet,
+    uri: sourceUploadPath,
+    metadata: {
+      uploaded: true,
+      originalFilename: "numbers.csv"
+    },
+    createdAt: new Date().toISOString()
+  });
+  await runtime.orchestrator.requestCancel(sourceTask.id);
+
+  const result = await runtime.orchestrator.createRetryTask(sourceTask.id);
+  const retryArtifacts = await runtime.artifactRepository.listByTask(result.retryTask.id);
+  const clonedUpload = retryArtifacts.find((artifact) => artifact.metadata["uploaded"] === true);
+  assert.ok(clonedUpload);
+  assert.notEqual(clonedUpload?.uri, sourceUploadPath);
+  assert.equal(clonedUpload?.uri.startsWith(path.join(workspaceRoot, result.retryTask.id, "uploads")), true);
+  const contents = await fs.readFile(String(clonedUpload?.uri), "utf8");
+  assert.match(contents, /12/);
+});
+
+test("retryable prepare job failures are requeued and reset draft tasks", async () => {
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-manus-job-retry-"));
+  const runtime = buildDemoRuntime(workspaceRoot, new ConsoleLogger(false));
+  const worker = new TaskQueueWorker(
+    runtime.orchestrator,
+    runtime.taskJobRepository,
+    runtime.taskEventRepository,
+    new ConsoleLogger(false),
+    "worker_retry_test"
+  );
+
+  const task = await runtime.orchestrator.createDraftTask({
+    userId: "user_job_retry",
+    goal: "TASK: 生成一个简短 markdown 报告"
+  });
+  const job = await runtime.taskJobRepository.enqueue(
+    createTaskJob(task.id, TaskJobKind.PrepareTask)
+  );
+
+  const originalPrepareTaskById = runtime.orchestrator.prepareTaskById.bind(runtime.orchestrator);
+  let attempts = 0;
+  runtime.orchestrator.prepareTaskById = async (taskId: string) => {
+    attempts += 1;
+    if (attempts === 1) {
+      const failedTask = await runtime.taskRepository.getById(taskId);
+      assert.ok(failedTask);
+      failedTask.status = TaskStatus.Failed;
+      failedTask.updatedAt = new Date().toISOString();
+      await runtime.taskRepository.update(failedTask);
+      throw new Error("network timeout while planning");
+    }
+    return originalPrepareTaskById(taskId);
+  };
+
+  const firstRun = await worker.runNextJob();
+  assert.equal(firstRun, true);
+
+  const requeuedJob = await runtime.taskJobRepository.getById(job.id);
+  assert.equal(requeuedJob?.status, TaskJobStatus.Pending);
+
+  const resetTask = await runtime.taskRepository.getById(task.id);
+  assert.equal(resetTask?.status, TaskStatus.Created);
+
+  const secondRun = await worker.runNextJob();
+  assert.equal(secondRun, true);
+
+  const finalJob = await runtime.taskJobRepository.getById(job.id);
+  assert.equal(finalJob?.status, TaskJobStatus.Completed);
+
+  const preparedTask = await runtime.taskRepository.getById(task.id);
+  assert.ok(preparedTask);
+  assert.equal(preparedTask.status, TaskStatus.Planned);
 });
 
 test("stale running jobs can be reclaimed after lease expiry", async () => {

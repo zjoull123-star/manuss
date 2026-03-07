@@ -4,9 +4,12 @@ import { promises as fs } from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { WorkspaceManager } from "../../artifacts/src";
+import { ArtifactRegistry, WorkspaceManager } from "../../artifacts/src";
+import { createInMemoryRepositories } from "../../db/src";
 import { AgentKind, ToolName } from "../../core/src";
-import { BrowserTool, DocumentTool, PythonTool } from "../src";
+import { ConsoleLogger } from "../../observability/src";
+import { ToolPolicyService } from "../../policy/src";
+import { BrowserTool, DocumentTool, PythonTool, ToolRuntime, type Tool } from "../src";
 
 test("python tool executes a local script and captures generated files", async () => {
   const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-manus-python-"));
@@ -226,4 +229,91 @@ test("browser tool downloads files with a persistent profile directory", async (
   } finally {
     await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
   }
+});
+
+test("tool runtime converts thrown tool errors into structured failures", async () => {
+  const repositories = createInMemoryRepositories();
+  const runtime = new ToolRuntime(
+    [
+      {
+        name: ToolName.Document,
+        execute: async () => {
+          throw new Error("playwright render timed out");
+        }
+      } satisfies Tool
+    ],
+    new ToolPolicyService(),
+    new ArtifactRegistry(repositories.artifactRepository, new WorkspaceManager(await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-manus-tool-runtime-")))),
+    repositories.toolCallRepository,
+    repositories.taskEventRepository,
+    new ConsoleLogger(false)
+  );
+
+  const response = await runtime.execute({
+    taskId: "task_tool_throw",
+    stepId: "s1",
+    toolName: ToolName.Document,
+    action: "render_pdf",
+    callerAgent: AgentKind.Document,
+    input: {}
+  });
+
+  assert.equal(response.status, "failed");
+  assert.equal(response.error?.stage, "tool_runtime");
+  assert.equal(response.error?.category, "unhandled_tool_exception");
+  assert.equal(response.error?.retryable, true);
+
+  const toolCalls = await repositories.toolCallRepository.listByTask("task_tool_throw");
+  assert.equal(toolCalls.length, 1);
+  assert.equal(toolCalls[0]?.status, "failed");
+
+  const events = await repositories.taskEventRepository.listByTask("task_tool_throw");
+  assert.equal(
+    events.some(
+      (event) =>
+        event.kind === "tool_call" &&
+        event.message === "document.render_pdf failed"
+    ),
+    true
+  );
+});
+
+test("artifact registry rejects generated artifacts outside the workspace root", async () => {
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-manus-artifact-root-"));
+  const outsideRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-manus-artifact-outside-"));
+  const outsideFile = path.join(outsideRoot, "outside.pdf");
+  await fs.writeFile(outsideFile, "outside", "utf8");
+  const repositories = createInMemoryRepositories();
+  const runtime = new ToolRuntime(
+    [
+      {
+        name: ToolName.Document,
+        execute: async () => ({
+          status: "success",
+          summary: "Generated a PDF",
+          artifacts: [outsideFile]
+        })
+      } satisfies Tool
+    ],
+    new ToolPolicyService(),
+    new ArtifactRegistry(repositories.artifactRepository, new WorkspaceManager(workspaceRoot)),
+    repositories.toolCallRepository,
+    repositories.taskEventRepository,
+    new ConsoleLogger(false)
+  );
+
+  const response = await runtime.execute({
+    taskId: "task_artifact_outside",
+    stepId: "s1",
+    toolName: ToolName.Document,
+    action: "render_pdf",
+    callerAgent: AgentKind.Document,
+    input: {}
+  });
+
+  assert.equal(response.status, "failed");
+  assert.equal(response.error?.stage, "tool_runtime");
+  assert.match(String(response.error?.message ?? ""), /outside workspace root/);
+  const artifacts = await repositories.artifactRepository.listByTask("task_artifact_outside");
+  assert.equal(artifacts.length, 0);
 });

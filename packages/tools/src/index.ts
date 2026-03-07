@@ -73,6 +73,35 @@ const normalizeToolFailure = (
   }
 });
 
+const normalizeUnexpectedToolFailure = (
+  request: ToolRequest,
+  error: unknown
+): ToolResponse => {
+  const message = error instanceof Error ? error.message : String(error);
+  const lower = message.toLowerCase();
+  const timeout = lower.includes("timed out") || lower.includes("timeout");
+  const retryable =
+    timeout ||
+    lower.includes("network") ||
+    lower.includes("econn") ||
+    lower.includes("enotfound") ||
+    lower.includes("temporar") ||
+    lower.includes("playwright");
+
+  return {
+    status: "failed",
+    summary: `${request.toolName}.${request.action} failed unexpectedly`,
+    error: {
+      code: timeout ? ErrorCode.Timeout : ErrorCode.ToolUnavailable,
+      message,
+      retryable,
+      stage: "tool_runtime",
+      category: "unhandled_tool_exception",
+      upstreamErrorMessage: message
+    }
+  };
+};
+
 const asString = (value: unknown, fallback = ""): string =>
   typeof value === "string" ? value : fallback;
 
@@ -1161,7 +1190,20 @@ export class ToolRuntime {
         }
       )
     );
-    const response = await tool.execute(request);
+    let response: ToolResponse;
+    try {
+      response = await tool.execute(request);
+      if (response.artifacts && response.artifacts.length > 0) {
+        await this.artifactRegistry.recordGeneratedArtifacts(
+          request.taskId,
+          request.stepId,
+          response.artifacts,
+          request.toolName
+        );
+      }
+    } catch (error: unknown) {
+      response = normalizeUnexpectedToolFailure(request, error);
+    }
     const durationMs = response.metrics?.durationMs ?? Date.now() - startedAt;
 
     const toolCall: ToolCall = {
@@ -1203,15 +1245,6 @@ export class ToolRuntime {
         }
       )
     );
-
-    if (response.artifacts && response.artifacts.length > 0) {
-      await this.artifactRegistry.recordGeneratedArtifacts(
-        request.taskId,
-        request.stepId,
-        response.artifacts,
-        request.toolName
-      );
-    }
 
     this.logger.info("Tool executed", {
       taskId: request.taskId,

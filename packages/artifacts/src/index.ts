@@ -8,6 +8,13 @@ import {
 } from "../../core/src";
 import { createId } from "../../shared/src";
 
+const isPathInside = (rootDir: string, candidatePath: string): boolean => {
+  const resolvedRoot = path.resolve(rootDir);
+  const resolvedCandidate = path.resolve(candidatePath);
+  const relative = path.relative(resolvedRoot, resolvedCandidate);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+};
+
 const inferArtifactType = (uri: string): ArtifactType => {
   const extension = path.extname(uri).toLowerCase();
 
@@ -45,8 +52,24 @@ export class WorkspaceManager {
     this.rootDir = path.resolve(rootDir);
   }
 
+  getRootDir(): string {
+    return this.rootDir;
+  }
+
+  getTaskWorkspacePath(taskId: string): string {
+    return path.join(this.rootDir, taskId);
+  }
+
+  isWithinWorkspace(candidatePath: string): boolean {
+    return isPathInside(this.rootDir, candidatePath);
+  }
+
+  isWithinTaskWorkspace(taskId: string, candidatePath: string): boolean {
+    return isPathInside(this.getTaskWorkspacePath(taskId), candidatePath);
+  }
+
   async ensureTaskWorkspace(taskId: string): Promise<string> {
-    const taskDir = path.join(this.rootDir, taskId);
+    const taskDir = this.getTaskWorkspacePath(taskId);
     await fs.mkdir(taskDir, { recursive: true });
     return taskDir;
   }
@@ -74,10 +97,25 @@ export class WorkspaceManager {
     await fs.writeFile(filePath, contents);
     return filePath;
   }
+
+  async copyFileIntoTaskWorkspace(
+    taskId: string,
+    sourcePath: string,
+    relativePath: string
+  ): Promise<string> {
+    const taskDir = await this.ensureTaskWorkspace(taskId);
+    const filePath = path.join(taskDir, relativePath);
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    await fs.copyFile(sourcePath, filePath);
+    return filePath;
+  }
 }
 
 export class ArtifactRegistry {
-  constructor(private readonly artifactRepository: ArtifactRepository) {}
+  constructor(
+    private readonly artifactRepository: ArtifactRepository,
+    private readonly workspaceManager: WorkspaceManager
+  ) {}
 
   async recordGeneratedArtifacts(
     taskId: string,
@@ -88,6 +126,9 @@ export class ArtifactRegistry {
     const saved: Artifact[] = [];
 
     for (const uri of uris) {
+      if (!this.workspaceManager.isWithinWorkspace(uri)) {
+        throw new Error(`Artifact path is outside workspace root: ${uri}`);
+      }
       const artifact: Artifact = {
         id: createId("artifact"),
         taskId,

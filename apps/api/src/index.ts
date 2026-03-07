@@ -18,6 +18,7 @@ import { ConsoleLogger } from "../../../packages/observability/src";
 import { createId } from "../../../packages/shared/src";
 
 const port = Number(process.env.PORT ?? 3000);
+const host = process.env.HOST ?? "127.0.0.1";
 const workspaceRoot =
   process.env.OPENCLAW_WORKSPACE_ROOT ??
   path.resolve(process.cwd(), ".data", "tasks-api");
@@ -124,6 +125,16 @@ const getContentType = (filePath: string): string => {
       return "application/octet-stream";
   }
 };
+
+const isPathInside = (rootDir: string, candidatePath: string): boolean => {
+  const resolvedRoot = path.resolve(rootDir);
+  const resolvedCandidate = path.resolve(candidatePath);
+  const relative = path.relative(resolvedRoot, resolvedCandidate);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+};
+
+const taskWorkspaceRoot = (taskId: string): string =>
+  path.resolve(runtime.workspaceRoot, taskId);
 
 const summarizeTask = (task: {
   id: string;
@@ -737,6 +748,10 @@ const server = http.createServer(async (request, response) => {
 
       const body = await readBufferBody(request);
       const targetPath = path.join(runtime.workspaceRoot, uploadTaskId, "uploads", filename);
+      if (!isPathInside(taskWorkspaceRoot(uploadTaskId), targetPath)) {
+        sendJson(response, 403, { error: "Upload path resolved outside task workspace" });
+        return;
+      }
       await fs.mkdir(path.dirname(targetPath), { recursive: true });
       await fs.writeFile(targetPath, body);
 
@@ -797,6 +812,10 @@ const server = http.createServer(async (request, response) => {
       const artifact = artifacts.find((candidate) => candidate.id === artifactId);
       if (!artifact) {
         sendJson(response, 404, { error: "Artifact not found" });
+        return;
+      }
+      if (!isPathInside(taskWorkspaceRoot(artifactContentTaskId), artifact.uri)) {
+        sendJson(response, 403, { error: "Artifact path is outside task workspace" });
         return;
       }
 
@@ -938,6 +957,6 @@ const server = http.createServer(async (request, response) => {
   }
 });
 
-server.listen(port, () => {
-  console.log(`API listening on http://localhost:${port}`);
+server.listen(port, host, () => {
+  console.log(`API listening on http://${host}:${port}`);
 });

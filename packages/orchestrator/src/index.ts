@@ -1,4 +1,5 @@
 import path from "node:path";
+import { promises as fs } from "node:fs";
 import {
   AgentRequest,
   AgentResponse,
@@ -104,6 +105,46 @@ class StepTimeoutError extends Error {
 const getErrorMessage = (error: unknown): string =>
   error instanceof Error ? error.message : String(error);
 
+const isRetryableJobError = (error: unknown): boolean => {
+  if (error && typeof error === "object") {
+    const candidate = error as {
+      retryable?: unknown;
+      code?: unknown;
+      cause?: unknown;
+    };
+    if (candidate.retryable === true) {
+      return true;
+    }
+    if (
+      candidate.code === ErrorCode.Timeout ||
+      candidate.code === ErrorCode.NetworkError ||
+      candidate.code === ErrorCode.RateLimit ||
+      candidate.code === ErrorCode.ToolUnavailable
+    ) {
+      return true;
+    }
+    if (candidate.cause) {
+      return isRetryableJobError(candidate.cause);
+    }
+  }
+
+  const message = getErrorMessage(error).toLowerCase();
+  if (message.includes("insufficient_quota") || message.includes("permission denied")) {
+    return false;
+  }
+  return (
+    message.includes("timed out") ||
+    message.includes("timeout") ||
+    message.includes("network") ||
+    message.includes("rate limit") ||
+    message.includes("temporar") ||
+    message.includes("fetch failed") ||
+    message.includes("playwright") ||
+    message.includes("econn") ||
+    message.includes("enotfound")
+  );
+};
+
 const pickPreferredFinalArtifact = (artifactUris: string[]): string | undefined => {
   if (artifactUris.length === 0) {
     return undefined;
@@ -168,6 +209,7 @@ export class TaskOrchestrator {
     private readonly userProfileRepository: UserProfileRepository,
     private readonly contextBuilder: ContextBuilder,
     private readonly memoryWriter: MemoryWriter,
+    private readonly workspaceManager: WorkspaceManager,
     private readonly logger: Logger,
     private readonly maxRetries = 2,
     private readonly stepTimeoutMs = 300_000
@@ -293,6 +335,7 @@ export class TaskOrchestrator {
       retryOfTaskId: sourceTask.id
     });
     await this.taskRepository.create(retryTask);
+    await this.cloneUploadedArtifactsForRetry(sourceTask, retryTask);
     await this.recordTaskStatus(retryTask, `Retry task created from ${sourceTask.id}`);
     await this.saveCheckpointAndEvent(retryTask);
     const job = await this.taskJobRepository.enqueue(
@@ -313,6 +356,46 @@ export class TaskOrchestrator {
       }
     );
     return { sourceTask, retryTask, job };
+  }
+
+  async prepareTaskForRetry(taskId: string, jobKind: TaskJobKind, reason: string): Promise<void> {
+    const task = await this.taskRepository.getById(taskId);
+    if (!task || [TaskStatus.Completed, TaskStatus.Cancelled].includes(task.status)) {
+      return;
+    }
+
+    let changed = false;
+    if (jobKind === TaskJobKind.PrepareTask) {
+      if (task.currentPlanVersion === 0 && task.status === TaskStatus.Failed) {
+        task.status = TaskStatus.Created;
+        changed = true;
+      }
+    } else {
+      for (const step of task.steps) {
+        if (step.status === StepStatus.Running || step.status === StepStatus.Verifying) {
+          step.status = StepStatus.Pending;
+          delete step.error;
+          changed = true;
+        }
+      }
+      if (
+        changed &&
+        [TaskStatus.Running, TaskStatus.Retrying, TaskStatus.Verifying, TaskStatus.Failed].includes(
+          task.status
+        )
+      ) {
+        task.status = task.currentPlanVersion > 0 ? TaskStatus.Planned : TaskStatus.Created;
+      }
+    }
+
+    if (!changed) {
+      return;
+    }
+
+    task.updatedAt = nowIso();
+    await this.taskRepository.update(task);
+    await this.recordTaskStatus(task, `Task reset for queue retry after: ${reason}`);
+    await this.saveCheckpointAndEvent(task);
   }
 
   async requestCancel(taskId: string): Promise<Task> {
@@ -984,6 +1067,57 @@ export class TaskOrchestrator {
     await this.userProfileRepository.save(profile);
     return profile;
   }
+
+  private async cloneUploadedArtifactsForRetry(sourceTask: Task, retryTask: Task): Promise<void> {
+    const sourceArtifacts = await this.artifactRepository.listByTask(sourceTask.id);
+    const uploadedArtifacts = sourceArtifacts.filter(
+      (artifact) => artifact.metadata["uploaded"] === true
+    );
+
+    if (uploadedArtifacts.length === 0) {
+      return;
+    }
+
+    const clonedArtifacts = await Promise.all(
+      uploadedArtifacts.map(async (artifact) => {
+        const resolvedSource = path.resolve(artifact.uri);
+        const originalFilename =
+          typeof artifact.metadata["originalFilename"] === "string"
+            ? String(artifact.metadata["originalFilename"])
+            : path.basename(resolvedSource);
+        const relativeTarget = path.join("uploads", `${artifact.id}-${path.basename(originalFilename)}`);
+        await fs.access(resolvedSource);
+        const clonedUri = await this.workspaceManager.copyFileIntoTaskWorkspace(
+          retryTask.id,
+          resolvedSource,
+          relativeTarget
+        );
+
+        return this.artifactRepository.save({
+          ...artifact,
+          id: createId("artifact"),
+          taskId: retryTask.id,
+          uri: clonedUri,
+          createdAt: nowIso(),
+          metadata: {
+            ...artifact.metadata,
+            clonedFromTaskId: sourceTask.id,
+            clonedFromArtifactId: artifact.id
+          }
+        });
+      })
+    );
+
+    await this.recordEvent(
+      retryTask.id,
+      TaskEventKind.Tool,
+      `Cloned ${clonedArtifacts.length} uploaded artifact(s) from retry source`,
+      {
+        sourceTaskId: sourceTask.id,
+        artifactIds: clonedArtifacts.map((artifact) => artifact.id)
+      }
+    );
+  }
 }
 
 export class TaskQueueWorker {
@@ -1075,8 +1209,12 @@ export class TaskQueueWorker {
       return true;
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
+      const retryable = isRetryableJobError(error);
       try {
-        await this.taskJobRepository.markFailed(job.id, this.workerId, message, false);
+        if (retryable) {
+          await this.orchestrator.prepareTaskForRetry(job.taskId, job.kind, message);
+        }
+        await this.taskJobRepository.markFailed(job.id, this.workerId, message, retryable);
         await this.taskEventRepository.create(
           createTaskEvent(
             job.taskId,
@@ -1150,8 +1288,8 @@ export const buildDemoRuntime = (
     memoryRepository,
     prisma
   } = repositories;
-  const workspaceManager = new WorkspaceManager(workspaceRoot);
-  const artifactRegistry = new ArtifactRegistry(artifactRepository);
+      const workspaceManager = new WorkspaceManager(workspaceRoot);
+  const artifactRegistry = new ArtifactRegistry(artifactRepository, workspaceManager);
   const toolMode = resolveToolExecutionMode();
   const agentMode = resolveAgentExecutionMode();
   const searchToolOptions: ConstructorParameters<typeof SearchTool>[1] = {
@@ -1243,6 +1381,7 @@ export const buildDemoRuntime = (
       userProfileRepository,
       contextBuilder,
       memoryWriter,
+      workspaceManager,
       logger,
       2,
       Number(process.env.OPENCLAW_STEP_TIMEOUT_MS ?? 300_000)
