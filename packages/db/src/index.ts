@@ -32,6 +32,12 @@ import {
   TaskJobStatus,
   ToolCall,
   ToolCallRepository,
+  WideResearchItem,
+  WideResearchItemRepository,
+  WideResearchRun,
+  WideResearchRunRepository,
+  BrowserSession,
+  BrowserSessionRepository,
   UserProfile,
   UserProfileRepository
 } from "../../core/src";
@@ -306,6 +312,87 @@ export class InMemoryToolCallRepository implements ToolCallRepository {
 
   async listByTask(taskId: string): Promise<ToolCall[]> {
     return structuredClone(this.toolCalls.get(taskId) ?? []);
+  }
+}
+
+export class InMemoryWideResearchRunRepository implements WideResearchRunRepository {
+  private readonly runs = new Map<string, WideResearchRun>();
+
+  async save(run: WideResearchRun): Promise<WideResearchRun> {
+    this.runs.set(run.id, structuredClone(run));
+    return structuredClone(run);
+  }
+
+  async getByStep(taskId: string, stepId: string): Promise<WideResearchRun | undefined> {
+    const match = [...this.runs.values()]
+      .filter((run) => run.taskId === taskId && run.stepId === stepId)
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0];
+    return match ? structuredClone(match) : undefined;
+  }
+
+  async listByTask(taskId: string): Promise<WideResearchRun[]> {
+    return [...this.runs.values()]
+      .filter((run) => run.taskId === taskId)
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
+      .map((run) => structuredClone(run));
+  }
+}
+
+export class InMemoryWideResearchItemRepository implements WideResearchItemRepository {
+  private readonly items = new Map<string, WideResearchItem[]>();
+
+  async save(item: WideResearchItem): Promise<WideResearchItem> {
+    const existing = this.items.get(item.wideResearchRunId) ?? [];
+    const next = [...existing.filter((candidate) => candidate.id !== item.id), structuredClone(item)].sort(
+      (left, right) => left.orderIndex - right.orderIndex
+    );
+    this.items.set(item.wideResearchRunId, next);
+    return structuredClone(item);
+  }
+
+  async replaceForRun(
+    wideResearchRunId: string,
+    items: WideResearchItem[]
+  ): Promise<WideResearchItem[]> {
+    this.items.set(
+      wideResearchRunId,
+      items
+        .map((item) => structuredClone(item))
+        .sort((left, right) => left.orderIndex - right.orderIndex)
+    );
+    return this.listByRun(wideResearchRunId);
+  }
+
+  async listByRun(wideResearchRunId: string): Promise<WideResearchItem[]> {
+    return [...(this.items.get(wideResearchRunId) ?? [])].map((item) => structuredClone(item));
+  }
+}
+
+export class InMemoryBrowserSessionRepository implements BrowserSessionRepository {
+  private readonly sessions = new Map<string, BrowserSession>();
+
+  async save(session: BrowserSession): Promise<BrowserSession> {
+    this.sessions.set(session.browserProfileId, structuredClone(session));
+    return structuredClone(session);
+  }
+
+  async getByProfileId(browserProfileId: string): Promise<BrowserSession | undefined> {
+    const session = this.sessions.get(browserProfileId);
+    return session ? structuredClone(session) : undefined;
+  }
+
+  async listRecent(limit = 20): Promise<BrowserSession[]> {
+    return [...this.sessions.values()]
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+      .slice(0, Math.max(1, limit))
+      .map((session) => structuredClone(session));
+  }
+
+  async listByTask(taskId: string): Promise<BrowserSession[]> {
+    return [...this.sessions.values()]
+      .filter((session) => session.taskId === taskId)
+      .sort((left, right) => left.updatedAt.localeCompare(right.updatedAt))
+      .map((session) => structuredClone(session));
   }
 }
 
@@ -1938,6 +2025,266 @@ class PrismaTaskReferenceRepository implements TaskReferenceRepository {
   }
 }
 
+class PrismaWideResearchRunRepository implements WideResearchRunRepository {
+  constructor(
+    private readonly prisma: PrismaClient,
+    private readonly bootstrap: PrismaSqliteBootstrap
+  ) {}
+
+  async save(run: WideResearchRun): Promise<WideResearchRun> {
+    await this.bootstrap.ensureInitialized();
+    const record = await (this.prisma as any).wideResearchRunRecord.upsert({
+      where: { id: run.id },
+      update: {
+        taskId: run.taskId,
+        stepId: run.stepId,
+        planVersion: run.planVersion,
+        goal: run.goal,
+        status: run.status,
+        totalItems: run.totalItems,
+        completedItems: run.completedItems,
+        failedItems: run.failedItems,
+        aggregatedSourceCount: run.aggregatedSourceCount ?? null,
+        metadataJson: serializeJson(run.metadata),
+        createdAt: toDate(run.createdAt),
+        updatedAt: toDate(run.updatedAt)
+      },
+      create: {
+        id: run.id,
+        taskId: run.taskId,
+        stepId: run.stepId,
+        planVersion: run.planVersion,
+        goal: run.goal,
+        status: run.status,
+        totalItems: run.totalItems,
+        completedItems: run.completedItems,
+        failedItems: run.failedItems,
+        aggregatedSourceCount: run.aggregatedSourceCount ?? null,
+        metadataJson: serializeJson(run.metadata),
+        createdAt: toDate(run.createdAt),
+        updatedAt: toDate(run.updatedAt)
+      }
+    });
+    return this.map(record);
+  }
+
+  async getByStep(taskId: string, stepId: string): Promise<WideResearchRun | undefined> {
+    await this.bootstrap.ensureInitialized();
+    const record = await (this.prisma as any).wideResearchRunRecord.findFirst({
+      where: { taskId, stepId },
+      orderBy: { updatedAt: "desc" }
+    });
+    return record ? this.map(record) : undefined;
+  }
+
+  async listByTask(taskId: string): Promise<WideResearchRun[]> {
+    await this.bootstrap.ensureInitialized();
+    const records = await (this.prisma as any).wideResearchRunRecord.findMany({
+      where: { taskId },
+      orderBy: { createdAt: "asc" }
+    });
+    return records.map((record: any) => this.map(record));
+  }
+
+  private map(record: any): WideResearchRun {
+    return {
+      id: record.id,
+      taskId: record.taskId,
+      stepId: record.stepId,
+      planVersion: record.planVersion,
+      goal: record.goal,
+      status: record.status,
+      totalItems: record.totalItems,
+      completedItems: record.completedItems,
+      failedItems: record.failedItems,
+      ...(typeof record.aggregatedSourceCount === "number"
+        ? { aggregatedSourceCount: record.aggregatedSourceCount }
+        : {}),
+      metadata: parseJsonObject(record.metadataJson),
+      createdAt: record.createdAt.toISOString(),
+      updatedAt: record.updatedAt.toISOString()
+    };
+  }
+}
+
+class PrismaWideResearchItemRepository implements WideResearchItemRepository {
+  constructor(
+    private readonly prisma: PrismaClient,
+    private readonly bootstrap: PrismaSqliteBootstrap
+  ) {}
+
+  async save(item: WideResearchItem): Promise<WideResearchItem> {
+    await this.bootstrap.ensureInitialized();
+    const record = await (this.prisma as any).wideResearchItemRecord.upsert({
+      where: { id: item.id },
+      update: {
+        wideResearchRunId: item.wideResearchRunId,
+        taskId: item.taskId,
+        stepId: item.stepId,
+        orderIndex: item.orderIndex,
+        query: item.query,
+        title: item.title ?? null,
+        status: item.status,
+        sourceCount: item.sourceCount ?? null,
+        summary: item.summary ?? null,
+        errorMessage: item.errorMessage ?? null,
+        metadataJson: serializeJson(item.metadata),
+        createdAt: toDate(item.createdAt),
+        updatedAt: toDate(item.updatedAt)
+      },
+      create: {
+        id: item.id,
+        wideResearchRunId: item.wideResearchRunId,
+        taskId: item.taskId,
+        stepId: item.stepId,
+        orderIndex: item.orderIndex,
+        query: item.query,
+        title: item.title ?? null,
+        status: item.status,
+        sourceCount: item.sourceCount ?? null,
+        summary: item.summary ?? null,
+        errorMessage: item.errorMessage ?? null,
+        metadataJson: serializeJson(item.metadata),
+        createdAt: toDate(item.createdAt),
+        updatedAt: toDate(item.updatedAt)
+      }
+    });
+    return this.map(record);
+  }
+
+  async replaceForRun(
+    wideResearchRunId: string,
+    items: WideResearchItem[]
+  ): Promise<WideResearchItem[]> {
+    await this.bootstrap.ensureInitialized();
+    await (this.prisma as any).wideResearchItemRecord.deleteMany({
+      where: { wideResearchRunId }
+    });
+    for (const item of items) {
+      await this.save(item);
+    }
+    return this.listByRun(wideResearchRunId);
+  }
+
+  async listByRun(wideResearchRunId: string): Promise<WideResearchItem[]> {
+    await this.bootstrap.ensureInitialized();
+    const records = await (this.prisma as any).wideResearchItemRecord.findMany({
+      where: { wideResearchRunId },
+      orderBy: { orderIndex: "asc" }
+    });
+    return records.map((record: any) => this.map(record));
+  }
+
+  private map(record: any): WideResearchItem {
+    return {
+      id: record.id,
+      wideResearchRunId: record.wideResearchRunId,
+      taskId: record.taskId,
+      stepId: record.stepId,
+      orderIndex: record.orderIndex,
+      query: record.query,
+      ...(record.title ? { title: record.title } : {}),
+      status: record.status,
+      ...(typeof record.sourceCount === "number" ? { sourceCount: record.sourceCount } : {}),
+      ...(record.summary ? { summary: record.summary } : {}),
+      ...(record.errorMessage ? { errorMessage: record.errorMessage } : {}),
+      metadata: parseJsonObject(record.metadataJson),
+      createdAt: record.createdAt.toISOString(),
+      updatedAt: record.updatedAt.toISOString()
+    };
+  }
+}
+
+class PrismaBrowserSessionRepository implements BrowserSessionRepository {
+  constructor(
+    private readonly prisma: PrismaClient,
+    private readonly bootstrap: PrismaSqliteBootstrap
+  ) {}
+
+  async save(session: BrowserSession): Promise<BrowserSession> {
+    await this.bootstrap.ensureInitialized();
+    const record = await (this.prisma as any).browserSessionRecord.upsert({
+      where: { browserProfileId: session.browserProfileId },
+      update: {
+        taskId: session.taskId ?? null,
+        stepId: session.stepId ?? null,
+        profileDir: session.profileDir,
+        storageStatePath: session.storageStatePath ?? null,
+        downloadDir: session.downloadDir ?? null,
+        currentUrl: session.currentUrl ?? null,
+        canonicalUrl: session.canonicalUrl ?? null,
+        lastAction: session.lastAction,
+        lastReplayArtifactUri: session.lastReplayArtifactUri ?? null,
+        metadataJson: serializeJson(session.metadata),
+        createdAt: toDate(session.createdAt),
+        updatedAt: toDate(session.updatedAt)
+      },
+      create: {
+        id: session.id,
+        browserProfileId: session.browserProfileId,
+        taskId: session.taskId ?? null,
+        stepId: session.stepId ?? null,
+        profileDir: session.profileDir,
+        storageStatePath: session.storageStatePath ?? null,
+        downloadDir: session.downloadDir ?? null,
+        currentUrl: session.currentUrl ?? null,
+        canonicalUrl: session.canonicalUrl ?? null,
+        lastAction: session.lastAction,
+        lastReplayArtifactUri: session.lastReplayArtifactUri ?? null,
+        metadataJson: serializeJson(session.metadata),
+        createdAt: toDate(session.createdAt),
+        updatedAt: toDate(session.updatedAt)
+      }
+    });
+    return this.map(record);
+  }
+
+  async getByProfileId(browserProfileId: string): Promise<BrowserSession | undefined> {
+    await this.bootstrap.ensureInitialized();
+    const record = await (this.prisma as any).browserSessionRecord.findUnique({
+      where: { browserProfileId }
+    });
+    return record ? this.map(record) : undefined;
+  }
+
+  async listRecent(limit = 20): Promise<BrowserSession[]> {
+    await this.bootstrap.ensureInitialized();
+    const records = await (this.prisma as any).browserSessionRecord.findMany({
+      orderBy: { updatedAt: "desc" },
+      take: Math.max(1, limit)
+    });
+    return records.map((record: any) => this.map(record));
+  }
+
+  async listByTask(taskId: string): Promise<BrowserSession[]> {
+    await this.bootstrap.ensureInitialized();
+    const records = await (this.prisma as any).browserSessionRecord.findMany({
+      where: { taskId },
+      orderBy: { updatedAt: "asc" }
+    });
+    return records.map((record: any) => this.map(record));
+  }
+
+  private map(record: any): BrowserSession {
+    return {
+      id: record.id,
+      browserProfileId: record.browserProfileId,
+      ...(record.taskId ? { taskId: record.taskId } : {}),
+      ...(record.stepId ? { stepId: record.stepId } : {}),
+      profileDir: record.profileDir,
+      ...(record.storageStatePath ? { storageStatePath: record.storageStatePath } : {}),
+      ...(record.downloadDir ? { downloadDir: record.downloadDir } : {}),
+      ...(record.currentUrl ? { currentUrl: record.currentUrl } : {}),
+      ...(record.canonicalUrl ? { canonicalUrl: record.canonicalUrl } : {}),
+      lastAction: record.lastAction,
+      ...(record.lastReplayArtifactUri ? { lastReplayArtifactUri: record.lastReplayArtifactUri } : {}),
+      metadata: parseJsonObject(record.metadataJson),
+      createdAt: record.createdAt.toISOString(),
+      updatedAt: record.updatedAt.toISOString()
+    };
+  }
+}
+
 class PrismaBenchmarkRunRepository implements BenchmarkRunRepository {
   constructor(
     private readonly prisma: PrismaClient,
@@ -2071,6 +2418,9 @@ export interface RepositoryBundle {
   taskSummaryRepository: TaskSummaryRepository;
   artifactIndexRepository: ArtifactIndexRepository;
   taskReferenceRepository: TaskReferenceRepository;
+  wideResearchRunRepository: WideResearchRunRepository;
+  wideResearchItemRepository: WideResearchItemRepository;
+  browserSessionRepository: BrowserSessionRepository;
   userProfileRepository: UserProfileRepository;
   toolCallRepository: ToolCallRepository;
   approvalRequestRepository: ApprovalRequestRepository;
@@ -2089,6 +2439,9 @@ export const createInMemoryRepositories = (): RepositoryBundle => ({
   taskSummaryRepository: new InMemoryTaskSummaryRepository(),
   artifactIndexRepository: new InMemoryArtifactIndexRepository(),
   taskReferenceRepository: new InMemoryTaskReferenceRepository(),
+  wideResearchRunRepository: new InMemoryWideResearchRunRepository(),
+  wideResearchItemRepository: new InMemoryWideResearchItemRepository(),
+  browserSessionRepository: new InMemoryBrowserSessionRepository(),
   userProfileRepository: new InMemoryUserProfileRepository(),
   toolCallRepository: new InMemoryToolCallRepository(),
   approvalRequestRepository: new InMemoryApprovalRequestRepository(),
@@ -2119,6 +2472,9 @@ export const createPrismaRepositories = (databaseUrl?: string): RepositoryBundle
     taskSummaryRepository: new PrismaTaskSummaryRepository(prisma, bootstrap),
     artifactIndexRepository: new PrismaArtifactIndexRepository(prisma, bootstrap),
     taskReferenceRepository: new PrismaTaskReferenceRepository(prisma, bootstrap),
+    wideResearchRunRepository: new PrismaWideResearchRunRepository(prisma, bootstrap),
+    wideResearchItemRepository: new PrismaWideResearchItemRepository(prisma, bootstrap),
+    browserSessionRepository: new PrismaBrowserSessionRepository(prisma, bootstrap),
     userProfileRepository: new PrismaUserProfileRepository(prisma, bootstrap),
     toolCallRepository: new PrismaToolCallRepository(prisma, bootstrap),
     approvalRequestRepository: new PrismaApprovalRequestRepository(prisma, bootstrap),

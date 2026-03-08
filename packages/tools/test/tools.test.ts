@@ -257,6 +257,68 @@ test("browser tool downloads files with a persistent profile directory", async (
   }
 });
 
+test("tool runtime persists browser sessions for browser outputs", async () => {
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-manus-browser-session-"));
+  const profileRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-manus-browser-session-profile-"));
+  const repositories = createInMemoryRepositories();
+  const server = http.createServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+    response.end("<html><body>browser session ok</body></html>");
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const pageUrl = `http://127.0.0.1:${address.port}/`;
+
+  try {
+    const runtime = new ToolRuntime(
+      [
+        new BrowserTool(new WorkspaceManager(workspaceRoot), {
+          mode: "live",
+          headless: true,
+          profileRootDir: profileRoot
+        })
+      ],
+      new ToolPolicyService(),
+      new ArtifactRegistry(repositories.artifactRepository, new WorkspaceManager(workspaceRoot)),
+      repositories.toolCallRepository,
+      repositories.taskEventRepository,
+      new ConsoleLogger(false),
+      repositories.browserSessionRepository
+    );
+
+    const response = await runtime.execute({
+      taskId: "task_browser_session",
+      stepId: "s1",
+      toolName: ToolName.Browser,
+      action: "open",
+      callerAgent: AgentKind.Browser,
+      browserProfileId: "session-profile",
+      input: {
+        url: pageUrl
+      }
+    });
+
+    assert.equal(response.status, "success");
+    const session = await repositories.browserSessionRepository.getByProfileId("session-profile");
+    assert.ok(session);
+    assert.equal(session?.taskId, "task_browser_session");
+    assert.equal(session?.stepId, "s1");
+    assert.equal(session?.lastAction, "browser.open");
+    assert.match(String(session?.currentUrl ?? ""), /^http:\/\/127\.0\.0\.1:/);
+
+    const events = await repositories.taskEventRepository.listByTask("task_browser_session");
+    assert.equal(
+      events.some((event) => event.kind === "browser_session_updated"),
+      true
+    );
+  } finally {
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve()))
+    );
+  }
+});
+
 test("tool runtime converts thrown tool errors into structured failures", async () => {
   const repositories = createInMemoryRepositories();
   const runtime = new ToolRuntime(

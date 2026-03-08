@@ -6,6 +6,7 @@ import ExcelJS from "exceljs";
 import nodemailer from "nodemailer";
 import PptxGenJS from "pptxgenjs";
 import {
+  BrowserSessionRepository,
   createTaskEvent,
   ErrorCode,
   TaskEventKind,
@@ -2059,11 +2060,83 @@ export class ToolRuntime {
     private readonly artifactRegistry: ArtifactRegistry,
     private readonly toolCallRepository: ToolCallRepository,
     private readonly taskEventRepository: TaskEventRepository,
-    private readonly logger: Logger
+    private readonly logger: Logger,
+    private readonly browserSessionRepository?: BrowserSessionRepository
   ) {
     for (const tool of tools) {
       this.registry.set(tool.name, tool);
     }
+  }
+
+  private async persistBrowserSession(
+    request: ToolRequest,
+    response: ToolResponse
+  ): Promise<void> {
+    if (!this.browserSessionRepository || request.toolName !== ToolName.Browser) {
+      return;
+    }
+    const output = asJsonObject(response.output);
+    const browserProfileId = asString(output["browserProfileId"]);
+    const profileDir = asString(output["profileDir"]);
+    if (!browserProfileId || !profileDir) {
+      return;
+    }
+
+    const existing = await this.browserSessionRepository.getByProfileId(browserProfileId);
+    const session = await this.browserSessionRepository.save({
+      id: existing?.id ?? createId("bsession"),
+      browserProfileId,
+      taskId: request.taskId,
+      stepId: request.stepId,
+      profileDir,
+      ...(asString(output["storageStatePath"])
+        ? { storageStatePath: asString(output["storageStatePath"]) }
+        : existing?.storageStatePath
+          ? { storageStatePath: existing.storageStatePath }
+          : {}),
+      ...(asString(output["downloadDir"])
+        ? { downloadDir: asString(output["downloadDir"]) }
+        : existing?.downloadDir
+          ? { downloadDir: existing.downloadDir }
+          : {}),
+      ...(asString(output["currentUrl"])
+        ? { currentUrl: asString(output["currentUrl"]) }
+        : existing?.currentUrl
+          ? { currentUrl: existing.currentUrl }
+          : {}),
+      ...(asString(output["canonicalUrl"])
+        ? { canonicalUrl: asString(output["canonicalUrl"]) }
+        : existing?.canonicalUrl
+          ? { canonicalUrl: existing.canonicalUrl }
+          : {}),
+      lastAction: `${request.toolName}.${request.action}`,
+      ...(response.artifacts?.[0] ? { lastReplayArtifactUri: response.artifacts[0] } : {}),
+      metadata: {
+        ...(existing?.metadata ?? {}),
+        status: response.status,
+        callerAgent: request.callerAgent
+      },
+      createdAt: existing?.createdAt ?? new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    });
+
+    await this.taskEventRepository.create(
+      createTaskEvent(
+        request.taskId,
+        TaskEventKind.BrowserSessionUpdated,
+        `Browser session updated: ${browserProfileId}`,
+        {
+          browserProfileId: session.browserProfileId,
+          lastAction: session.lastAction,
+          ...(session.currentUrl ? { currentUrl: session.currentUrl } : {}),
+          ...(session.storageStatePath ? { storageStatePath: session.storageStatePath } : {}),
+          ...(session.downloadDir ? { downloadDir: session.downloadDir } : {})
+        },
+        {
+          stepId: request.stepId
+        }
+      )
+    );
   }
 
   async execute(request: ToolRequest): Promise<ToolResponse> {
@@ -2111,6 +2184,7 @@ export class ToolRuntime {
           request.toolName
         );
       }
+      await this.persistBrowserSession(request, response);
     } catch (error: unknown) {
       response = normalizeUnexpectedToolFailure(request, error);
     }

@@ -3,6 +3,7 @@ const state = {
   tasks: [],
   selectedBundle: null,
   recipes: [],
+  skills: [],
   qualityMetrics: null,
   benchmarkRuns: [],
   pollingHandle: null,
@@ -26,6 +27,7 @@ const el = {
   taskCount: $("task-count"),
   qualityMetrics: $("quality-metrics"),
   benchmarkRuns: $("benchmark-runs"),
+  skillManifests: $("skill-manifests"),
   runSmokeBenchmark: $("run-smoke-benchmark"),
   selectedTaskStatus: $("selected-task-status"),
   detailEmpty: $("detail-empty"),
@@ -39,6 +41,8 @@ const el = {
   finalArtifactPanel: $("final-artifact-panel"),
   finalValidationPanel: $("final-validation-panel"),
   referenceList: $("reference-list"),
+  wideResearchList: $("wide-research-list"),
+  browserSessionList: $("browser-session-list"),
   stepList: $("step-list"),
   approvalList: $("approval-list"),
   jobList: $("job-list"),
@@ -192,7 +196,9 @@ const renderQualityMetrics = () => {
     return;
   }
 
-  const entries = Object.entries(metrics.taskClasses);
+  const entries = Array.isArray(metrics.taskClasses)
+    ? metrics.taskClasses.map((entry) => [entry.taskClass || "unknown", entry])
+    : Object.entries(metrics.taskClasses);
   if (entries.length === 0) {
     el.qualityMetrics.innerHTML = `<div class="event-card"><p class="muted">暂无质量指标。</p></div>`;
     return;
@@ -216,6 +222,34 @@ const renderQualityMetrics = () => {
         </article>
       `;
     })
+    .join("");
+};
+
+const renderSkillManifests = () => {
+  if (!state.skills.length) {
+    el.skillManifests.innerHTML = `<div class="event-card"><p class="muted">暂无 skill manifests。</p></div>`;
+    return;
+  }
+
+  el.skillManifests.innerHTML = state.skills
+    .map(
+      (skill) => `
+        <article class="event-card">
+          <div class="card-title">${escapeHtml(skill.title || skill.id)}</div>
+          <div class="card-meta">
+            ${skill.taskClass ? `<span>${escapeHtml(skill.taskClass)}</span>` : ""}
+            ${Array.isArray(skill.preferredDeliverables)
+              ? `<span>${escapeHtml(skill.preferredDeliverables.join("/"))}</span>`
+              : ""}
+          </div>
+          ${
+            Array.isArray(skill.auditTags) && skill.auditTags.length > 0
+              ? `<p>${escapeHtml(skill.auditTags.join(", "))}</p>`
+              : `<p class="muted">${escapeHtml(skill.id)}</p>`
+          }
+        </article>
+      `
+    )
     .join("");
 };
 
@@ -420,6 +454,57 @@ const renderReferences = (references) => {
             ${reference.sourceTaskId ? `<span>task=${escapeHtml(reference.sourceTaskId)}</span>` : ""}
             ${reference.sourceArtifactId ? `<span>artifact=${escapeHtml(reference.sourceArtifactId)}</span>` : ""}
           </div>
+        </article>
+      `
+    )
+    .join("");
+};
+
+const renderWideResearch = (runs) => {
+  if (!runs || runs.length === 0) {
+    return `<div class="event-card"><p class="muted">当前任务暂无 wide research fan-out 数据。</p></div>`;
+  }
+
+  return runs
+    .map(
+      (run) => `
+        <article class="event-card">
+          <div class="card-title">${escapeHtml(run.stepId || run.id)}</div>
+          <div class="card-meta">
+            <span>${escapeHtml(run.status)}</span>
+            <span>items=${escapeHtml(run.totalItems)}</span>
+            <span>sources=${escapeHtml(run.aggregatedSourceCount || 0)}</span>
+          </div>
+          ${
+            Array.isArray(run.items) && run.items.length > 0
+              ? `<p>${escapeHtml(
+                  run.items
+                    .map((item) => `${item.orderIndex + 1}. ${item.query} [${item.status}]`)
+                    .join(" | ")
+                )}</p>`
+              : `<p class="muted">暂无子查询明细。</p>`
+          }
+        </article>
+      `
+    )
+    .join("");
+};
+
+const renderBrowserSessions = (sessions) => {
+  if (!sessions || sessions.length === 0) {
+    return `<div class="event-card"><p class="muted">当前任务暂无浏览器 session。</p></div>`;
+  }
+
+  return sessions
+    .map(
+      (session) => `
+        <article class="event-card">
+          <div class="card-title">${escapeHtml(session.browserProfileId)}</div>
+          <div class="card-meta">
+            <span>${escapeHtml(session.lastAction)}</span>
+            ${session.currentUrl ? `<span>${escapeHtml(session.currentUrl)}</span>` : ""}
+          </div>
+          <p class="muted">${escapeHtml(session.profileDir)}</p>
         </article>
       `
     )
@@ -633,6 +718,8 @@ const renderSelectedTask = () => {
     el.eventList.innerHTML = "";
     el.finalValidationPanel.innerHTML = "";
     el.referenceList.innerHTML = "";
+    el.wideResearchList.innerHTML = "";
+    el.browserSessionList.innerHTML = "";
     el.indexedArtifactList.innerHTML = "";
     return;
   }
@@ -646,6 +733,8 @@ const renderSelectedTask = () => {
   el.finalArtifactPanel.innerHTML = renderFinalArtifact(bundle.task, bundle.artifacts || []);
   el.finalValidationPanel.innerHTML = renderFinalValidation(bundle.finalArtifactValidation);
   el.referenceList.innerHTML = renderReferences(bundle.references || []);
+  el.wideResearchList.innerHTML = renderWideResearch(bundle.wideResearch || []);
+  el.browserSessionList.innerHTML = renderBrowserSessions(bundle.browserSessions || []);
   el.stepTimeline.innerHTML = renderStepTimeline(bundle.task.steps || []);
   el.stepList.innerHTML = renderSteps(bundle.task.steps || []);
   el.approvalList.innerHTML = renderApprovals(bundle.approvals || []);
@@ -788,9 +877,15 @@ const refreshRecipes = async () => {
   renderRecipeOptions();
 };
 
+const refreshSkills = async () => {
+  const payload = await jsonFetch("/skills");
+  state.skills = payload.skills || [];
+  renderSkillManifests();
+};
+
 const refreshQualityMetrics = async () => {
   const payload = await jsonFetch("/metrics/quality");
-  state.qualityMetrics = payload.metrics || null;
+  state.qualityMetrics = payload.metrics || payload || null;
   renderQualityMetrics();
 };
 
@@ -857,6 +952,7 @@ const submitTask = async (event) => {
 const refreshAll = async () => {
   await renderRuntime();
   await refreshRecipes();
+  await refreshSkills();
   await refreshQualityMetrics();
   await refreshBenchmarkRuns();
   await refreshTasks();
@@ -916,6 +1012,7 @@ const pollingTick = () => {
   void renderRuntime();
   void refreshQualityMetrics();
   void refreshBenchmarkRuns();
+  void refreshSkills();
 };
 
 setPreviewMessage("点击产物进行预览。");

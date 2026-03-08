@@ -79,6 +79,56 @@ export interface FinalArtifactValidation {
   issues: string[];
 }
 
+export interface WideResearchRun {
+  id: string;
+  taskId: string;
+  stepId: string;
+  planVersion: number;
+  goal: string;
+  status: "PENDING" | "RUNNING" | "COMPLETED" | "FAILED";
+  totalItems: number;
+  completedItems: number;
+  failedItems: number;
+  aggregatedSourceCount?: number;
+  metadata: JsonObject;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface WideResearchItem {
+  id: string;
+  wideResearchRunId: string;
+  taskId: string;
+  stepId: string;
+  orderIndex: number;
+  query: string;
+  title?: string;
+  status: "PENDING" | "RUNNING" | "COMPLETED" | "FAILED";
+  sourceCount?: number;
+  summary?: string;
+  errorMessage?: string;
+  metadata: JsonObject;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface BrowserSession {
+  id: string;
+  browserProfileId: string;
+  taskId?: string;
+  stepId?: string;
+  profileDir: string;
+  storageStatePath?: string;
+  downloadDir?: string;
+  currentUrl?: string;
+  canonicalUrl?: string;
+  lastAction: string;
+  lastReplayArtifactUri?: string;
+  metadata: JsonObject;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface TaskOrigin {
   channelId: string;
   accountId?: string;

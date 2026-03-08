@@ -20,6 +20,7 @@ export interface ModelConfig {
 
 export type TaskClassHint =
   | "research_browser"
+  | "wide_research"
   | "coding_python"
   | "document_export"
   | "action_execution";
@@ -300,10 +301,10 @@ export class ModelRouter {
     taskClass?: TaskClassHint
   ): number {
     if (stage === "research") {
-      return 90_000;
+      return taskClass === "wide_research" ? 120_000 : 90_000;
     }
     if (stage === "browser") {
-      return 60_000;
+      return taskClass === "wide_research" ? 90_000 : 60_000;
     }
     if (stage === "coding" || stage === "document") {
       return taskClass === "document_export" ? 90_000 : 75_000;

@@ -11,6 +11,7 @@ import {
   createTaskFromPlan,
   createTaskJob,
   StepStatus,
+  TaskClass,
   TaskEventKind,
   TaskJobKind,
   TaskJobStatus,
@@ -205,6 +206,29 @@ test("prepare job creates a plan and enqueues execute work", async () => {
 
   const followUpJobs = await runtime.taskJobRepository.listByTask(task.id);
   assert.equal(followUpJobs.some((job) => job.kind === TaskJobKind.ExecuteTask), true);
+});
+
+test("wide research steps persist fan-out runs and items", async () => {
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-manus-wide-research-"));
+  const runtime = buildDemoRuntime(workspaceRoot, new ConsoleLogger(false));
+
+  const task = await runtime.orchestrator.handleGoal({
+    userId: "user_wide_research",
+    goal: "调研在阿联酋开设香水制造公司的可行性与落地路径，输出可执行报告"
+  });
+
+  assert.equal(task.status, TaskStatus.Completed);
+  const runs = await runtime.wideResearchRunRepository.listByTask(task.id);
+  assert.equal(runs.length > 0, true);
+  const run = runs[0];
+  assert.ok(run);
+  assert.equal(run?.totalItems >= 1, true);
+  const items = run ? await runtime.wideResearchItemRepository.listByRun(run.id) : [];
+  assert.equal(items.length > 0, true);
+  assert.equal(
+    task.steps.some((step) => step.taskClass === TaskClass.WideResearch),
+    true
+  );
 });
 
 test("prepareTaskById prefixes legacy draft goals before routing", async () => {

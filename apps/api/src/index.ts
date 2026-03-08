@@ -17,7 +17,12 @@ import { DEFAULT_OPENAI_MODELS } from "../../../packages/llm/src";
 import { buildDemoRuntime } from "../../../packages/orchestrator/src";
 import { ConsoleLogger } from "../../../packages/observability/src";
 import { createId, JsonObject } from "../../../packages/shared/src";
-import { getRecipeById, listRecipes, matchRecipeForGoal } from "../../../packages/recipes/src";
+import {
+  getRecipeById,
+  listRecipes,
+  listSkillManifests,
+  matchRecipeForGoal
+} from "../../../packages/recipes/src";
 import { listBenchmarkCases, runBenchmarkSuite } from "../../../packages/evals/src";
 
 const port = Number(process.env.PORT ?? 3000);
@@ -422,10 +427,18 @@ const buildTaskBundle = async (taskId: string): Promise<Record<string, unknown> 
     runtime.checkpointRepository.getLatest(taskId),
     runtime.taskEventRepository.listByTask(taskId, 500)
   ]);
-  const [references, indexedArtifacts] = await Promise.all([
+  const [references, indexedArtifacts, wideResearchRuns, browserSessions] = await Promise.all([
     runtime.taskReferenceRepository.listByTask(taskId),
-    runtime.artifactIndexRepository.listByTask(taskId)
+    runtime.artifactIndexRepository.listByTask(taskId),
+    runtime.wideResearchRunRepository.listByTask(taskId),
+    runtime.browserSessionRepository.listByTask(taskId)
   ]);
+  const wideResearch = await Promise.all(
+    wideResearchRuns.map(async (run) => ({
+      ...run,
+      items: await runtime.wideResearchItemRepository.listByRun(run.id)
+    }))
+  );
 
   return {
     task: summarizeTaskForApi({
@@ -440,6 +453,8 @@ const buildTaskBundle = async (taskId: string): Promise<Record<string, unknown> 
     toolCalls,
     events,
     references,
+    wideResearch,
+    browserSessions,
     finalArtifactValidation: task.finalArtifactValidation ?? null,
     indexedArtifacts,
     checkpoint: checkpoint ?? null
@@ -634,8 +649,25 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
+    if (request.method === "GET" && pathname === "/skills") {
+      sendJson(response, 200, {
+        skills: listSkillManifests()
+      });
+      return;
+    }
+
     if (request.method === "GET" && pathname === "/metrics/quality") {
       sendJson(response, 200, await buildQualityMetrics());
+      return;
+    }
+
+    if (request.method === "GET" && pathname === "/browser/sessions") {
+      const limit = asPositiveInt(url.searchParams.get("limit"), 20);
+      const taskId = url.searchParams.get("taskId");
+      const sessions = taskId
+        ? await runtime.browserSessionRepository.listByTask(taskId)
+        : await runtime.browserSessionRepository.listRecent(limit);
+      sendJson(response, 200, { sessions });
       return;
     }
 
@@ -804,6 +836,25 @@ const server = http.createServer(async (request, response) => {
       }
       const references = await runtime.taskReferenceRepository.listByTask(referenceTaskId);
       sendJson(response, 200, { references });
+      return;
+    }
+
+    const taskWideResearchMatch = pathname.match(/^\/tasks\/([^/]+)\/wide-research$/);
+    const wideResearchTaskId = taskWideResearchMatch?.[1];
+    if (request.method === "GET" && wideResearchTaskId) {
+      const task = await runtime.taskRepository.getById(wideResearchTaskId);
+      if (!task) {
+        sendJson(response, 404, { error: "Task not found" });
+        return;
+      }
+      const runs = await runtime.wideResearchRunRepository.listByTask(wideResearchTaskId);
+      const enrichedRuns = await Promise.all(
+        runs.map(async (run) => ({
+          ...run,
+          items: await runtime.wideResearchItemRepository.listByRun(run.id)
+        }))
+      );
+      sendJson(response, 200, { runs: enrichedRuns });
       return;
     }
 

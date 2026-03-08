@@ -34,6 +34,8 @@ model TaskRecord {
   references         TaskReferenceRecord[]
   artifactIndexes    ArtifactIndexRecord[]
   benchmarkItems     BenchmarkRunItemRecord[]
+  wideResearchRuns   WideResearchRunRecord[]
+  browserSessions    BrowserSessionRecord[]
 
   @@index([userId])
 }
@@ -245,6 +247,70 @@ model TaskReferenceRecord {
   task           TaskRecord @relation(fields: [taskId], references: [id], onDelete: Cascade)
 
   @@index([taskId, createdAt])
+}
+
+model WideResearchRunRecord {
+  id                   String   @id
+  taskId               String
+  stepId               String
+  planVersion          Int
+  goal                 String
+  status               String
+  totalItems           Int
+  completedItems       Int
+  failedItems          Int
+  aggregatedSourceCount Int?
+  metadataJson         String
+  createdAt            DateTime
+  updatedAt            DateTime
+  task                 TaskRecord @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  items                WideResearchItemRecord[]
+
+  @@unique([taskId, stepId, planVersion])
+  @@index([taskId, createdAt])
+}
+
+model WideResearchItemRecord {
+  id                String   @id
+  wideResearchRunId String
+  taskId            String
+  stepId            String
+  orderIndex        Int
+  query             String
+  title             String?
+  status            String
+  sourceCount       Int?
+  summary           String?
+  errorMessage      String?
+  metadataJson      String
+  createdAt         DateTime
+  updatedAt         DateTime
+  run               WideResearchRunRecord @relation(fields: [wideResearchRunId], references: [id], onDelete: Cascade)
+
+  @@index([wideResearchRunId, orderIndex])
+  @@index([taskId, createdAt])
+}
+
+model BrowserSessionRecord {
+  id                 String   @id
+  browserProfileId   String
+  taskId             String?
+  stepId             String?
+  profileDir         String
+  storageStatePath   String?
+  downloadDir        String?
+  currentUrl         String?
+  canonicalUrl       String?
+  lastAction         String
+  lastReplayArtifactUri String?
+  metadataJson       String
+  createdAt          DateTime
+  updatedAt          DateTime
+  task               TaskRecord? @relation(fields: [taskId], references: [id], onDelete: SetNull)
+
+  @@unique([browserProfileId])
+  @@index([taskId, updatedAt])
+  @@index([updatedAt])
 }
 
 model BenchmarkRunRecord {

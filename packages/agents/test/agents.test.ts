@@ -353,6 +353,22 @@ test("planner mock path preserves coding -> document -> pdf order for uploaded c
   assert.deepEqual(plan.steps[2]?.dependsOn, [plan.steps[1]?.id]);
 });
 
+test("planner routes direct local pdf text replacement goals to a single coding step", async () => {
+  const planner = new PlannerAgent(new ModelRouter(), undefined, "mock");
+  const plan = await planner.createPlan(
+    'TASK: 把 PDF 文件 /Users/ericesan/.openclaw/media/inbound/sample.pdf 中所有的 "ESAN TRADING FZE" 改成 "aerox space fze"，并输出新文件路径。',
+    {}
+  );
+
+  assert.equal(plan.steps.length, 1);
+  assert.equal(plan.steps[0]?.agent, AgentKind.Coding);
+  assert.equal(plan.steps[0]?.taskClass, TaskClass.CodingPython);
+  assert.match(
+    plan.steps[0]?.objective ?? "",
+    /replace the requested text inside the referenced PDF/i
+  );
+});
+
 test("browser agent falls back to the next candidate when the first page is blocked", async () => {
   const attempts: string[] = [];
   const toolRuntime = {
@@ -1816,6 +1832,54 @@ test("coding agent does not treat analysis steps as pdf export when the step obj
   assert.equal(renderPdfCalled, false);
   assert.equal(pythonCalled, true);
   assert.equal(response.status, "success");
+});
+
+test("coding agent uses local python replacement flow for direct local pdf text replacement goals", async () => {
+  const toolCalls: Array<{ toolName: ToolName; action: string; input: Record<string, unknown> }> = [];
+  const toolRuntime = {
+    execute: async (request: {
+      toolName: ToolName;
+      action: string;
+      input: Record<string, unknown>;
+    }) => {
+      toolCalls.push(request);
+      return {
+        status: "success" as const,
+        summary: "Executed local pdf replacement script",
+        artifacts: ["/tmp/modified-output.pdf", "/tmp/replacement-result.json"],
+        output: {
+          stdout: "{\"status\":\"ok\"}",
+          stderr: "",
+          generatedFiles: ["/tmp/modified-output.pdf", "/tmp/replacement-result.json"],
+          scriptPath: "/tmp/pdf-text-replace.py",
+          inputFiles: []
+        }
+      };
+    }
+  } as unknown as ToolRuntime;
+
+  const agent = new CodingAgent(toolRuntime, new ModelRouter(), undefined, "mock");
+  const response = await agent.execute({
+    taskId: "task_local_pdf_replace",
+    stepId: "s1",
+    goal: 'TASK: 把 PDF 文件 /Users/ericesan/.openclaw/media/inbound/sample.pdf 中所有的 "ESAN TRADING FZE" 改成 "aerox space fze"，并输出新文件路径。',
+    context: {
+      currentStep: {
+        id: "s1",
+        title: "Modify local PDF text",
+        objective:
+          "Use local Python to replace the requested text inside the referenced PDF and write a modified PDF plus a manifest with the output path."
+      }
+    },
+    successCriteria: ["A modified PDF artifact exists"],
+    artifacts: []
+  });
+
+  assert.equal(response.status, "success");
+  assert.equal(toolCalls.length, 1);
+  assert.equal(toolCalls[0]?.toolName, ToolName.Python);
+  assert.equal(toolCalls[0]?.action, "run_script");
+  assert.match(String(toolCalls[0]?.input.filename ?? ""), /pdf-text-replace/i);
 });
 
 test("coding agent exposes generated file previews for downstream verification", async () => {

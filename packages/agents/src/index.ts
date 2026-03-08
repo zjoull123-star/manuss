@@ -737,9 +737,34 @@ const validateDocumentDraft = (value: unknown): DocumentDraft => {
 
 const QUALITY_THRESHOLDS: Record<TaskClass, number> = {
   [TaskClass.ResearchBrowser]: 75,
+  [TaskClass.WideResearch]: 78,
   [TaskClass.CodingPython]: 80,
   [TaskClass.DocumentExport]: 80,
   [TaskClass.ActionExecution]: 80
+};
+
+const isWideResearchGoal = (goal: string): boolean => {
+  const normalizedGoal = stripTaskPrefix(goal);
+  const numberedRequirements = normalizedGoal
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => /^(\d+[\).、]|[-*])/.test(line));
+  return (
+    normalizedGoal.length >= 180 ||
+    numberedRequirements.length >= 4 ||
+    hasKeyword(normalizedGoal, [
+      "可行性",
+      "落地路径",
+      "实施路径",
+      "尽职调查",
+      "due diligence",
+      "wide research",
+      "深度调研",
+      "多来源",
+      "timeline",
+      "时间线"
+    ])
+  );
 };
 
 const buildQualityProfile = (
@@ -747,12 +772,17 @@ const buildQualityProfile = (
   goal: string,
   step?: Partial<Pick<TaskStep, "title" | "objective" | "successCriteria">>
 ): QualityProfile => {
-  if (taskClass === TaskClass.ResearchBrowser) {
+  if (taskClass === TaskClass.ResearchBrowser || taskClass === TaskClass.WideResearch) {
     return {
       requiredEvidence: hasKeyword(goal, ["时间线", "timeline", "latest", "最新"])
         ? ["sources", "findings", "timelineEvents"]
         : ["sources", "findings"],
-      minSourceCount: hasKeyword(goal, ["latest", "最新", "局势", "战情", "research", "调研"]) ? 3 : 2,
+      minSourceCount:
+        taskClass === TaskClass.WideResearch
+          ? 4
+          : hasKeyword(goal, ["latest", "最新", "局势", "战情", "research", "调研"])
+            ? 3
+            : 2,
       requireSchemaValid: true,
       requireOutputReadable: true
     };
@@ -800,6 +830,9 @@ const classifyTaskClass = (
   if (step.agent === AgentKind.Document) {
     return TaskClass.DocumentExport;
   }
+  if (step.agent === AgentKind.Research || step.agent === AgentKind.Browser) {
+    return isWideResearchGoal(goal) ? TaskClass.WideResearch : TaskClass.ResearchBrowser;
+  }
   return TaskClass.ResearchBrowser;
 };
 
@@ -834,7 +867,7 @@ const buildAttemptStrategy = (
     strategy,
     escalatedModel:
       attempt >= 1 &&
-      [TaskClass.ResearchBrowser, TaskClass.DocumentExport].includes(taskClass),
+      [TaskClass.ResearchBrowser, TaskClass.WideResearch, TaskClass.DocumentExport].includes(taskClass),
     maxRetries:
       agent === AgentKind.Research || agent === AgentKind.Browser
         ? 3
@@ -1376,6 +1409,22 @@ const SIDE_EFFECT_KEYWORDS = [
   "push to"
 ];
 
+const FILE_MUTATION_KEYWORDS = [
+  "替换",
+  "改成",
+  "改为",
+  "修改",
+  "编辑",
+  "覆盖",
+  "保存到原文件",
+  "输出新文件",
+  "replace",
+  "rewrite",
+  "edit",
+  "modify",
+  "overwrite"
+];
+
 const CODING_KEYWORDS = [
   "python",
   "脚本",
@@ -1395,9 +1444,98 @@ const CODING_KEYWORDS = [
 const REPORT_KEYWORDS = ["报告", "report", "总结", "summary", "markdown", "文档", "brief"];
 
 const PDF_KEYWORDS = ["pdf", "导出pdf", "输出pdf", "pdf文件", "导出为pdf", "排版并导出pdf"];
+const LOCAL_PDF_PATH_PATTERN = /\/Users\/[^\s"'“”）)]+\.pdf/iu;
 const EMAIL_KEYWORDS = ["email", "邮件", "mail", "发邮件"];
 const SLACK_KEYWORDS = ["slack"];
 const NOTION_KEYWORDS = ["notion"];
+
+type LocalPdfTextReplacementSpec = {
+  sourcePath: string;
+  searchText: string;
+  replacementText: string;
+  outputPath: string;
+};
+
+const extractQuotedStrings = (text: string): string[] =>
+  Array.from(text.matchAll(/[“"'']([^"'“”]+)[”"'']/g))
+    .map((match) => match[1]?.trim())
+    .filter((value): value is string => Boolean(value && value.length > 0));
+
+const sanitizeFileSuffix = (value: string): string =>
+  value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 32) || "modified";
+
+const extractLocalPdfTextReplacementSpec = (
+  goal: string
+): LocalPdfTextReplacementSpec | undefined => {
+  const normalizedGoal = stripTaskPrefix(goal);
+  if (!hasKeyword(normalizedGoal, FILE_MUTATION_KEYWORDS)) {
+    return undefined;
+  }
+
+  const sourcePath = normalizedGoal.match(LOCAL_PDF_PATH_PATTERN)?.[0];
+  if (!sourcePath) {
+    return undefined;
+  }
+
+  const quotedStrings = extractQuotedStrings(normalizedGoal);
+  if (quotedStrings.length < 2) {
+    return undefined;
+  }
+
+  const [searchText, replacementText] = quotedStrings;
+  if (!searchText || !replacementText || searchText === replacementText) {
+    return undefined;
+  }
+
+  const parsedPath = path.parse(sourcePath);
+  const outputPath = path.join(
+    parsedPath.dir,
+    `${parsedPath.name}_${sanitizeFileSuffix(replacementText)}${parsedPath.ext || ".pdf"}`
+  );
+
+  return {
+    sourcePath,
+    searchText,
+    replacementText,
+    outputPath
+  };
+};
+
+const isLocalPdfTextReplacementGoal = (goal: string): boolean =>
+  Boolean(extractLocalPdfTextReplacementSpec(goal));
+
+const buildLocalPdfTextReplacementPlan = (goal: string): Plan => ({
+  goal,
+  assumptions: [
+    "Use the explicitly referenced local PDF as the input artifact",
+    "Write a modified PDF copy instead of mutating the original file in place"
+  ],
+  steps: [
+    {
+      id: "s1",
+      title: "Modify local PDF text",
+      agent: AgentKind.Coding,
+      objective:
+        "Use local Python to replace the requested text inside the referenced PDF and write a modified PDF plus a manifest with the output path.",
+      dependsOn: [],
+      inputs: ["goal"],
+      expectedOutput: "Modified PDF artifact and replacement manifest",
+      successCriteria: [
+        "A modified PDF artifact exists",
+        "The output path is reported in the generated manifest",
+        "At least one text replacement is applied"
+      ]
+    }
+  ],
+  taskSuccessCriteria: [
+    "The referenced PDF is processed into a modified output file",
+    "The task returns a modified PDF artifact and output path"
+  ]
+});
 
 const buildUploadedFileCodingDraft = (input: AgentRequest): CodingDraft | undefined => {
   const currentStep = asJsonObject(input.context["currentStep"]);
@@ -1514,6 +1652,11 @@ const buildUploadedFileCodingDraft = (input: AgentRequest): CodingDraft | undefi
 };
 
 const buildMockCodingDraft = (input: AgentRequest): CodingDraft => {
+  const localPdfReplacementDraft = buildLocalPdfTextReplacementDraft(input);
+  if (localPdfReplacementDraft) {
+    return localPdfReplacementDraft;
+  }
+
   const uploadedFileDraft = buildUploadedFileCodingDraft(input);
   if (uploadedFileDraft) {
     return uploadedFileDraft;
@@ -1751,7 +1894,7 @@ const calculateQualityAssessment = (
     };
   }
 
-  if (taskClass === TaskClass.ResearchBrowser) {
+  if (taskClass === TaskClass.ResearchBrowser || taskClass === TaskClass.WideResearch) {
     const sources = Array.isArray(structured["sources"]) ? structured["sources"] : [];
     const findings = asFindingsArray(structured["findings"]);
     const extractedFacts = asStringArray(structured["extractedFacts"]);
@@ -1771,7 +1914,8 @@ const calculateQualityAssessment = (
       });
     const sourceCount =
       typeof structured["sourceCount"] === "number" ? Number(structured["sourceCount"]) : sources.length;
-    const minSourceCount = profile.minSourceCount ?? 2;
+    const minSourceCount =
+      profile.minSourceCount ?? (taskClass === TaskClass.WideResearch ? 4 : 2);
     sourceCoverageScore = Math.min(100, sourceCount * 20);
     if (sourceCount < minSourceCount) {
       qualityDefects.push(`source coverage below threshold (${sourceCount}/${minSourceCount})`);
@@ -1874,7 +2018,7 @@ const calculateQualityAssessment = (
     suggestedFix:
       verdict === "pass"
         ? ""
-        : taskClass === TaskClass.ResearchBrowser
+        : [TaskClass.ResearchBrowser, TaskClass.WideResearch].includes(taskClass)
           ? "Collect more authoritative sources or usable timeline evidence"
           : taskClass === TaskClass.CodingPython
             ? "Regenerate executable code and required artifacts"
@@ -2059,6 +2203,95 @@ const buildLocalPdfExportDraft = (input: AgentRequest): CodingDraft | undefined 
   };
 };
 
+const buildLocalPdfTextReplacementDraft = (input: AgentRequest): CodingDraft | undefined => {
+  const replacementSpec = extractLocalPdfTextReplacementSpec(input.goal);
+  if (!replacementSpec) {
+    return undefined;
+  }
+
+  const currentStep = asJsonObject(input.context["currentStep"]);
+  const objective = asOptionalString(currentStep["objective"]) ?? input.goal;
+  const payload = {
+    goal: stripTaskPrefix(input.goal),
+    objective,
+    sourcePath: replacementSpec.sourcePath,
+    searchText: replacementSpec.searchText,
+    replacementText: replacementSpec.replacementText,
+    targetOutputPath: replacementSpec.outputPath,
+    workspaceOutputName: "modified-output.pdf",
+    manifestName: "replacement-result.json"
+  };
+
+  const pythonCode = [
+    "from pathlib import Path",
+    "import json",
+    "import shutil",
+    "",
+    "import fitz",
+    "",
+    `payload = json.loads(${JSON.stringify(JSON.stringify(payload))})`,
+    "if isinstance(payload, str):",
+    "  payload = json.loads(payload)",
+    "source_path = Path(payload['sourcePath'])",
+    "if not source_path.exists():",
+    "  raise FileNotFoundError(f'Source PDF not found: {source_path}')",
+    "workspace_output = Path(payload['workspaceOutputName'])",
+    "manifest_path = Path(payload['manifestName'])",
+    "target_output = Path(payload['targetOutputPath'])",
+    "search_text = payload['searchText']",
+    "replacement_text = payload['replacementText']",
+    "doc = fitz.open(str(source_path))",
+    "occurrences = 0",
+    "pages_touched = []",
+    "for page_index in range(doc.page_count):",
+    "  page = doc.load_page(page_index)",
+    "  rects = page.search_for(search_text)",
+    "  if not rects:",
+    "    continue",
+    "  pages_touched.append(page_index + 1)",
+    "  for rect in rects:",
+    "    page.add_redact_annot(rect, fill=(1, 1, 1))",
+    "  page.apply_redactions()",
+    "  for rect in rects:",
+    "    page.insert_textbox(rect, replacement_text, fontname='helv', fontsize=10, color=(0, 0, 0), align=0)",
+    "  occurrences += len(rects)",
+    "if occurrences == 0:",
+    "  doc.close()",
+    "  raise RuntimeError(f'No occurrences of {search_text!r} were found in the source PDF')",
+    "doc.save(str(workspace_output))",
+    "doc.close()",
+    "copy_result = {'targetOutputPath': str(target_output), 'copiedToTarget': False}",
+    "try:",
+    "  target_output.parent.mkdir(parents=True, exist_ok=True)",
+    "  shutil.copy2(workspace_output, target_output)",
+    "  copy_result['copiedToTarget'] = True",
+    "except Exception as exc:",
+    "  copy_result['copyError'] = str(exc)",
+    "manifest = {",
+    "  'goal': payload['goal'],",
+    "  'objective': payload['objective'],",
+    "  'sourcePath': str(source_path),",
+    "  'targetOutputPath': str(target_output),",
+    "  'workspaceOutputPath': str(workspace_output),",
+    "  'searchText': search_text,",
+    "  'replacementText': replacement_text,",
+    "  'occurrences': occurrences,",
+    "  'pagesTouched': pages_touched,",
+    "  **copy_result",
+    "}",
+    "manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')",
+    "print(json.dumps({'generated': [str(workspace_output), str(manifest_path)], 'occurrences': occurrences, 'targetOutputPath': str(target_output), 'copiedToTarget': copy_result['copiedToTarget']}, ensure_ascii=False))"
+  ].join("\n");
+
+  return {
+    summary: `Modify the referenced local PDF and write a replacement copy for: ${objective}`,
+    filename: "pdf-text-replace.py",
+    pythonCode,
+    expectedArtifacts: ["modified-output.pdf", "replacement-result.json"],
+    fallbackKind: "python"
+  };
+};
+
 const buildDeterministicCodingFallback = (input: AgentRequest): CodingDraft =>
   (isPdfExportRequest(input) ? buildLocalPdfExportDraft(input) : undefined) ??
   buildMockCodingDraft(input);
@@ -2148,7 +2381,11 @@ const isExplicitPdfExportPlanStep = (
   const successCriteria = Array.isArray(step.successCriteria) ? step.successCriteria.join("\n") : "";
   const titleAndOutputText = [title, expectedOutput, successCriteria].join("\n");
 
-  if (hasKeyword(titleAndOutputText, PDF_KEYWORDS)) {
+  if (
+    hasKeyword(titleAndOutputText, PDF_KEYWORDS) &&
+    PDF_EXPORT_STEP_HINT_PATTERN.test(titleAndOutputText) &&
+    !PDF_PREPARATION_HINT_PATTERN.test(titleAndOutputText)
+  ) {
     return true;
   }
 
@@ -2289,6 +2526,18 @@ const normalizeDirectExecutionSteps = (goal: string, plan: Plan): Plan => {
   return plan;
 };
 
+const normalizeLocalPdfTextReplacementPlan = (goal: string, plan: Plan): Plan => {
+  if (!isLocalPdfTextReplacementGoal(goal)) {
+    return plan;
+  }
+
+  if (plan.steps.length === 1 && plan.steps[0]?.agent === AgentKind.Coding) {
+    return plan;
+  }
+
+  return buildLocalPdfTextReplacementPlan(goal);
+};
+
 const ensureDocumentBeforePdfStep = (goal: string, plan: Plan): Plan => {
   if (!hasKeyword(goal, PDF_KEYWORDS) || !hasKeyword(goal, REPORT_KEYWORDS)) {
     return plan;
@@ -2372,7 +2621,10 @@ const applyRecipeOverrides = (
 };
 
 const sanitizePlannedTask = (goal: string, plan: Plan, recipe?: RecipeDefinition): Plan => {
-  let sanitizedPlan = normalizePdfExportSteps(goal, plan);
+  const directPdfTextReplacement = isLocalPdfTextReplacementGoal(goal);
+  let sanitizedPlan = directPdfTextReplacement
+    ? normalizeLocalPdfTextReplacementPlan(goal, plan)
+    : normalizePdfExportSteps(goal, plan);
 
   if (!hasKeyword(goal, SIDE_EFFECT_KEYWORDS)) {
     const hasActionStep = sanitizedPlan.steps.some((step) => step.agent === AgentKind.Action);
@@ -2400,8 +2652,11 @@ const sanitizePlannedTask = (goal: string, plan: Plan, recipe?: RecipeDefinition
 
   sanitizedPlan = applyRecipeOverrides(goal, sanitizedPlan, recipe);
   sanitizedPlan = normalizeDirectExecutionSteps(goal, sanitizedPlan);
-  sanitizedPlan = ensurePdfExportStep(goal, sanitizedPlan);
-  sanitizedPlan = ensureDocumentBeforePdfStep(goal, sanitizedPlan);
+  sanitizedPlan = normalizeLocalPdfTextReplacementPlan(goal, sanitizedPlan);
+  if (!directPdfTextReplacement) {
+    sanitizedPlan = ensurePdfExportStep(goal, sanitizedPlan);
+    sanitizedPlan = ensureDocumentBeforePdfStep(goal, sanitizedPlan);
+  }
 
   return {
     ...sanitizedPlan,
@@ -2432,6 +2687,8 @@ const buildExecutionQuery = (input: AgentRequest): string => {
 
 const buildFocusedResearchQueries = (input: AgentRequest): string[] => {
   const baseQuery = buildExecutionQuery(input);
+  const stepContext = asJsonObject(input.context["currentStep"]);
+  const taskClass = asOptionalString(stepContext["taskClass"]);
   const normalizedGoal = stripTaskPrefix(input.goal);
   const lines = normalizedGoal
     .split(/\r?\n|(?<=[:：])|(?<=。)|(?<=；)|(?<=;)/)
@@ -2447,6 +2704,18 @@ const buildFocusedResearchQueries = (input: AgentRequest): string[] => {
     ...numberedRequirements.slice(0, 2).map((item) => `${baseQuery}\n${item}`),
     ...lines.slice(0, 2).map((item) => `${baseQuery}\n${item}`)
   ]).filter((query) => query.length > 0);
+
+  if (taskClass === TaskClass.WideResearch || isWideResearchGoal(input.goal)) {
+    const clauseCandidates = uniqueStrings(
+      normalizedGoal
+        .split(/[；;。]/)
+        .map((item) => item.trim())
+        .filter((item) => item.length >= 10)
+        .slice(0, 4)
+        .map((item) => `${baseQuery}\n${item}`)
+    );
+    return uniqueStrings([...candidates, ...clauseCandidates]).slice(0, 6);
+  }
 
   return candidates.slice(0, baseQuery.length > 180 ? 3 : 2);
 };
@@ -2854,6 +3123,7 @@ const extractSentenceLikeSnippets = (text: string, maxItems = 6): string[] =>
   ).slice(0, maxItems);
 
 const buildResearchFallbackResponse = (params: {
+  taskClass?: TaskClass;
   sourceCount: number;
   topResultUrl: string;
   candidateSourceUrls: string[];
@@ -2898,7 +3168,7 @@ const buildResearchFallbackResponse = (params: {
         ? `已基于 ${params.sourceCount} 个搜索来源生成规则化研究摘要并继续任务`
         : "已基于搜索结果生成规则化研究摘要并继续任务",
     structuredData: {
-      taskClass: TaskClass.ResearchBrowser,
+      taskClass: params.taskClass ?? TaskClass.ResearchBrowser,
       sourceCount: params.sourceCount,
       topResultUrl: params.topResultUrl,
       candidateSourceUrls: params.candidateSourceUrls,
@@ -2998,6 +3268,10 @@ export class PlannerAgent implements PlanningAgent {
   ) {}
 
   async createPlan(goal: string, context: JsonObject): Promise<Plan> {
+    if (isLocalPdfTextReplacementGoal(goal)) {
+      return sanitizePlannedTask(goal, buildLocalPdfTextReplacementPlan(goal));
+    }
+
     const explicitRecipeId = asOptionalString(context["recipeId"]);
     const recipe = getRecipeById(explicitRecipeId) ?? matchRecipeForGoal(goal);
     const recipeContext = recipe
@@ -3051,6 +3325,10 @@ export class PlannerAgent implements PlanningAgent {
   }
 
   private mockPlan(goal: string, recipe?: RecipeDefinition): Plan {
+    if (isLocalPdfTextReplacementGoal(goal)) {
+      return sanitizePlannedTask(goal, buildLocalPdfTextReplacementPlan(goal), recipe);
+    }
+
     const normalizedGoal = stripTaskPrefix(goal);
     const includesCoding = hasKeyword(normalizedGoal, CODING_KEYWORDS);
     const includesResearch = hasKeyword(normalizedGoal, [
@@ -3294,6 +3572,10 @@ export class ResearchAgent implements StepAgent {
   ) {}
 
   async execute(input: AgentRequest): Promise<AgentResponse> {
+    const currentStep = asJsonObject(input.context["currentStep"]);
+    const taskClass =
+      (asOptionalString(currentStep["taskClass"]) as TaskClass | undefined) ??
+      (isWideResearchGoal(input.goal) ? TaskClass.WideResearch : TaskClass.ResearchBrowser);
     const searchQueries =
       this.mode === "live" ? buildFocusedResearchQueries(input) : [buildExecutionQuery(input)];
     const searchResponses = await Promise.all(
@@ -3341,6 +3623,20 @@ export class ResearchAgent implements StepAgent {
     const timelineEvents = buildTimelineEventsFromSources(mergedResults);
     const sourceCount = sources.length;
     const sourceTiers = sources.map((source) => ({ url: source.url, tier: source.tier }));
+    const subqueryResults = searchQueries.map((query, index) => {
+      const response = searchResponses[index];
+      const results = Array.isArray(response?.output?.results) ? response.output.results : [];
+      const sourceEvidence = buildSourceEvidence(results);
+      return {
+        query,
+        orderIndex: index,
+        status: response?.status ?? "failed",
+        sourceCount: sourceEvidence.length,
+        summary: response?.summary ?? "",
+        sourceUrls: sourceEvidence.map((source) => source.url),
+        errorMessage: response?.error?.message ?? null
+      };
+    });
     const searchAnswer = uniqueStrings(
       searchResponses.flatMap((response) => {
         const answer = typeof response.output?.answer === "string" ? response.output.answer : "";
@@ -3362,6 +3658,8 @@ export class ResearchAgent implements StepAgent {
         ? input.context["previousStepEvidence"]
         : [],
       searchQueries,
+      taskClass,
+      subqueryResults,
       searchSummary,
       searchAnswer,
       results: mergedResults,
@@ -3393,11 +3691,14 @@ export class ResearchAgent implements StepAgent {
         const normalizedSynthesis = validateResearchSynthesis(synthesis.data as unknown);
 
         const structuredData: JsonObject = {
-          taskClass: TaskClass.ResearchBrowser,
+          taskClass,
           qualityProfile: asJsonObject(asJsonObject(input.context["currentStep"])["qualityProfile"]),
           sourceCount,
           topResultUrl: normalizedSynthesis.topResultUrl || topResultUrl,
           candidateSourceUrls,
+          searchQueries,
+          subqueryResults,
+          wideResearch: taskClass === TaskClass.WideResearch,
           sources,
           sourceTiers,
           findings: normalizedSynthesis.findings,
@@ -3428,9 +3729,13 @@ export class ResearchAgent implements StepAgent {
             );
 
             const structuredData: JsonObject = {
+              taskClass,
               sourceCount,
               topResultUrl: recoveredSynthesis.topResultUrl || topResultUrl,
               candidateSourceUrls,
+              searchQueries,
+              subqueryResults,
+              wideResearch: taskClass === TaskClass.WideResearch,
               sources,
               sourceTiers,
               findings: recoveredSynthesis.findings,
@@ -3456,6 +3761,7 @@ export class ResearchAgent implements StepAgent {
             };
           } catch (recoveryError) {
             const fallbackResponse = buildResearchFallbackResponse({
+              taskClass,
               sourceCount,
               topResultUrl,
               candidateSourceUrls,
@@ -3519,10 +3825,13 @@ export class ResearchAgent implements StepAgent {
         ? toolResponse.output.answer
         : "Synthetic findings: premium EV rental, airport delivery, and monthly subscriptions matter.";
     const structuredData: JsonObject = {
-      taskClass: TaskClass.ResearchBrowser,
+      taskClass,
       sourceCount,
       topResultUrl,
       candidateSourceUrls,
+      searchQueries,
+      subqueryResults,
+      wideResearch: taskClass === TaskClass.WideResearch,
       sources,
       sourceTiers,
       findings,
@@ -3563,6 +3872,12 @@ export class BrowserAgent implements StepAgent {
   ) {}
 
   async execute(input: AgentRequest): Promise<AgentResponse> {
+    const taskClass =
+      input.context["currentStep"] &&
+      typeof input.context["currentStep"] === "object" &&
+      (input.context["currentStep"] as JsonObject)["taskClass"] === TaskClass.WideResearch
+        ? TaskClass.WideResearch
+        : TaskClass.ResearchBrowser;
     const inheritedSources = extractInheritedResearchSources(input);
     let candidateUrls = getBrowserCandidateUrls(input.context);
     let bootstrapSearchSummary: string | undefined;
@@ -3594,7 +3909,7 @@ export class BrowserAgent implements StepAgent {
                 }
               ],
               maxOutputTokens: 600,
-              timeoutMs: this.modelRouter.getRequestTimeoutMs("browser", TaskClass.ResearchBrowser)
+              timeoutMs: this.modelRouter.getRequestTimeoutMs("browser", taskClass)
             });
             const suggestedUrls = extractHttpUrls(suggestion.outputText);
             if (suggestedUrls.length > 0) {
@@ -3722,6 +4037,7 @@ export class BrowserAgent implements StepAgent {
         status: "failed",
         summary: `Browser extraction failed using ${this.modelRouter.get("browser").model}`,
         structuredData: {
+          taskClass,
           attemptSummaries,
           candidateUrls,
           ...(bootstrapSearchSummary ? { bootstrapSearchSummary } : {})
@@ -3733,6 +4049,21 @@ export class BrowserAgent implements StepAgent {
         }
       };
     }
+
+    const pageQualitySignals = uniqueStrings(
+      attemptSummaries.flatMap((attempt) =>
+        [
+          attempt["blockedReason"] ? `blocked:${String(attempt["blockedReason"])}` : "",
+          attempt["nonSubstantiveReason"]
+            ? `low_substance:${String(attempt["nonSubstantiveReason"])}`
+            : "",
+          attempt["status"] && attempt["status"] !== "success"
+            ? `attempt_${String(attempt["status"]).toLowerCase()}`
+            : ""
+        ].filter(Boolean)
+      )
+    );
+    const captures = uniqueStrings(toolResponse.artifacts ?? []);
 
     if (selectedBlockedReason || selectedNonSubstantiveReason) {
       const evidenceFallback = buildEvidenceOnlyBrowserFallback(
@@ -3747,7 +4078,10 @@ export class BrowserAgent implements StepAgent {
         status: "failed",
         summary: "Browser extraction only found blocked or low-substance pages",
         structuredData: {
+          taskClass,
           attemptSummaries,
+          pageQualitySignals,
+          captures,
           candidateUrls,
           ...(selectedBlockedReason ? { blockedReason: selectedBlockedReason } : {}),
           ...(selectedNonSubstantiveReason
@@ -3795,14 +4129,14 @@ export class BrowserAgent implements StepAgent {
             schema: BROWSER_SYNTHESIS_SCHEMA
           },
           maxOutputTokens: 1_000,
-          timeoutMs: this.modelRouter.getRequestTimeoutMs("browser", TaskClass.ResearchBrowser)
+          timeoutMs: this.modelRouter.getRequestTimeoutMs("browser", taskClass)
         });
 
         return {
           status: "success",
           summary: synthesis.data.summary,
           structuredData: {
-            taskClass: TaskClass.ResearchBrowser,
+            taskClass,
             currentUrl:
               synthesis.data.currentUrl || String(toolResponse.output?.currentUrl ?? selectedUrl),
             pageTitle: synthesis.data.pageTitle || String(toolResponse.output?.pageTitle ?? ""),
@@ -3868,6 +4202,9 @@ export class BrowserAgent implements StepAgent {
             nextQuestions: synthesis.data.nextQuestions,
             extractedText: String(toolResponse.output?.extractedText ?? ""),
             attemptSummaries,
+            pageQualitySignals,
+            captures,
+            wideResearch: taskClass === TaskClass.WideResearch,
             ...(bootstrapSearchSummary ? { bootstrapSearchSummary } : {})
           },
           ...(toolResponse.artifacts ? { artifacts: toolResponse.artifacts } : {})
@@ -3885,7 +4222,7 @@ export class BrowserAgent implements StepAgent {
               status: "success",
               summary: recoveredSynthesis.summary,
               structuredData: {
-                taskClass: TaskClass.ResearchBrowser,
+                taskClass,
                 currentUrl:
                   recoveredSynthesis.currentUrl ||
                   String(toolResponse.output?.currentUrl ?? selectedUrl),
@@ -3960,6 +4297,9 @@ export class BrowserAgent implements StepAgent {
                 nextQuestions: recoveredSynthesis.nextQuestions,
                 extractedText: String(toolResponse.output?.extractedText ?? ""),
                 attemptSummaries,
+                pageQualitySignals,
+                captures,
+                wideResearch: taskClass === TaskClass.WideResearch,
                 ...(bootstrapSearchSummary ? { bootstrapSearchSummary } : {})
               },
               ...(toolResponse.artifacts ? { artifacts: toolResponse.artifacts } : {})
@@ -4009,7 +4349,7 @@ export class BrowserAgent implements StepAgent {
       status: toolResponse.status === "success" ? "success" : "failed",
       summary: `Browser extraction complete using ${this.modelRouter.get("browser").model}`,
       structuredData: {
-        taskClass: TaskClass.ResearchBrowser,
+        taskClass,
         extractedText,
         currentUrl,
         sourceUrls: uniqueStrings(browserSources.map((source) => source.url)),
@@ -4035,6 +4375,9 @@ export class BrowserAgent implements StepAgent {
         ),
         pageTitle,
         attemptSummaries,
+        pageQualitySignals,
+        captures,
+        wideResearch: taskClass === TaskClass.WideResearch,
         ...(bootstrapSearchSummary ? { bootstrapSearchSummary } : {})
       },
       ...(toolResponse.artifacts ? { artifacts: toolResponse.artifacts } : {}),
@@ -4226,7 +4569,8 @@ export class CodingAgent implements StepAgent {
   ) {}
 
   async execute(input: AgentRequest): Promise<AgentResponse> {
-    let draft = buildMockCodingDraft(input);
+    const directPdfReplacementDraft = buildLocalPdfTextReplacementDraft(input);
+    let draft = directPdfReplacementDraft ?? buildMockCodingDraft(input);
     const stepContext = asJsonObject(input.context["currentStep"]);
     let llmFallbackReason:
       | { summary: string; category: string; rawReason: string }
@@ -4240,7 +4584,7 @@ export class CodingAgent implements StepAgent {
       ...(uploadedArtifactUris.length > 0 ? { uploadedArtifactUris } : {})
     };
 
-    if (canUseLiveLlm(this.mode, this.llmClient)) {
+    if (canUseLiveLlm(this.mode, this.llmClient) && !directPdfReplacementDraft) {
       try {
         const response = await this.llmClient.generateJson<CodingDraft>({
           stage: "coding",

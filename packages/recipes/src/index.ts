@@ -12,11 +12,25 @@ export interface RecipeDefinition {
   preferredDeliverables: DeliveryKind[];
 }
 
+export interface SkillManifestDefinition {
+  id: string;
+  version: string;
+  title: string;
+  summary: string;
+  recipeId: string;
+  taskClass: TaskClass;
+  plannerHints: string[];
+  requiredSections: string[];
+  preferredAgents: string[];
+  preferredDeliverables: DeliveryKind[];
+  auditTags: string[];
+}
+
 const RECIPES: RecipeDefinition[] = [
   {
     id: "feasibility_report",
     title: "可行性报告",
-    taskClass: TaskClass.ResearchBrowser,
+    taskClass: TaskClass.WideResearch,
     plannerHints: [
       "Favor authoritative public sources and evidence-backed comparisons.",
       "Collect regulatory, cost, timeline, risk, and execution-path evidence before drafting."
@@ -34,7 +48,7 @@ const RECIPES: RecipeDefinition[] = [
   {
     id: "timeline_brief",
     title: "时间线简报",
-    taskClass: TaskClass.ResearchBrowser,
+    taskClass: TaskClass.WideResearch,
     plannerHints: [
       "Timeline tasks require date + event + sourceUrl evidence tuples.",
       "Prefer current and authoritative sources over long narrative summaries."
@@ -51,7 +65,7 @@ const RECIPES: RecipeDefinition[] = [
   {
     id: "market_research",
     title: "市场调研",
-    taskClass: TaskClass.ResearchBrowser,
+    taskClass: TaskClass.WideResearch,
     plannerHints: [
       "Collect competitors, pricing, channels, risks, and growth signals with citations."
     ],
@@ -116,6 +130,31 @@ const RECIPES: RecipeDefinition[] = [
   }
 ];
 
+const SKILL_MANIFESTS: SkillManifestDefinition[] = RECIPES.map((recipe) => ({
+  id: recipe.id,
+  version: "1.0.0",
+  title: recipe.title,
+  summary:
+    recipe.id === "feasibility_report"
+      ? "Wide-research skill for evidence-heavy feasibility and landing reports."
+      : recipe.id === "timeline_brief"
+        ? "Wide-research skill for timeline briefs and live situation reports."
+        : recipe.id === "market_research"
+          ? "Wide-research skill for market/competitor/pricing research."
+          : recipe.id === "dataset_analysis"
+            ? "Local Python skill for uploaded datasets and structured analysis."
+            : recipe.id === "browser_workflow"
+              ? "Browser workflow skill for extraction, screenshots, downloads, and storage state."
+              : "Document export skill for rendering Markdown into validated deliverables.",
+  recipeId: recipe.id,
+  taskClass: recipe.taskClass,
+  plannerHints: recipe.plannerHints,
+  requiredSections: recipe.requiredSections,
+  preferredAgents: recipe.preferredAgents,
+  preferredDeliverables: recipe.preferredDeliverables,
+  auditTags: uniqueAuditTagsForRecipe(recipe)
+}));
+
 const KEYWORD_MAP: Array<{ recipeId: string; keywords: string[] }> = [
   { recipeId: "feasibility_report", keywords: ["可行性", "落地", "实施路径", "监管", "制造", "factory", "feasibility"] },
   { recipeId: "timeline_brief", keywords: ["时间线", "timeline", "最新动态", "战情", "brief"] },
@@ -127,8 +166,16 @@ const KEYWORD_MAP: Array<{ recipeId: string; keywords: string[] }> = [
 
 export const listRecipes = (): RecipeDefinition[] => RECIPES.map((recipe) => ({ ...recipe }));
 
+export const listSkillManifests = (): SkillManifestDefinition[] =>
+  SKILL_MANIFESTS.map((manifest) => ({ ...manifest }));
+
 export const getRecipeById = (recipeId?: string): RecipeDefinition | undefined =>
   recipeId ? RECIPES.find((recipe) => recipe.id === recipeId) : undefined;
+
+export const getSkillManifestById = (
+  skillId?: string
+): SkillManifestDefinition | undefined =>
+  skillId ? SKILL_MANIFESTS.find((manifest) => manifest.id === skillId) : undefined;
 
 export const matchRecipeForGoal = (goal: string): RecipeDefinition | undefined => {
   const normalizedGoal = goal.toLowerCase();
@@ -189,3 +236,18 @@ export const buildRecipePlanningContext = (recipeId: string | undefined): JsonOb
     }
   };
 };
+
+function uniqueAuditTagsForRecipe(recipe: RecipeDefinition): string[] {
+  const tags = new Set<string>([
+    recipe.taskClass,
+    ...recipe.preferredAgents.map((agent) => agent.toLowerCase()),
+    ...recipe.preferredDeliverables.map((deliveryKind) => deliveryKind.toLowerCase())
+  ]);
+  if (recipe.id.includes("research") || recipe.taskClass === TaskClass.WideResearch) {
+    tags.add("wide_research");
+  }
+  if (recipe.id.includes("browser")) {
+    tags.add("browser_session");
+  }
+  return [...tags];
+}

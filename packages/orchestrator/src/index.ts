@@ -11,6 +11,7 @@ import {
   ArtifactRepository,
   ArtifactIndexEntry,
   ArtifactIndexRepository,
+  BrowserSessionRepository,
   Checkpoint,
   CheckpointRepository,
   createTaskEvent,
@@ -36,7 +37,9 @@ import {
   TaskStatus,
   ToolName,
   UserProfile,
-  UserProfileRepository
+  UserProfileRepository,
+  WideResearchItemRepository,
+  WideResearchRunRepository
 } from "../../core/src";
 import { ContextBuilder, MemoryWriter } from "../../memory/src";
 import { Logger } from "../../observability/src";
@@ -271,6 +274,8 @@ export class TaskOrchestrator {
     private readonly taskSummaryRepository: TaskSummaryRepository,
     private readonly artifactIndexRepository: ArtifactIndexRepository,
     private readonly taskReferenceRepository: TaskReferenceRepository,
+    private readonly wideResearchRunRepository: WideResearchRunRepository,
+    private readonly wideResearchItemRepository: WideResearchItemRepository,
     private readonly approvalRequestRepository: ApprovalRequestRepository,
     private readonly checkpointManager: CheckpointManager,
     private readonly userProfileRepository: UserProfileRepository,
@@ -279,7 +284,8 @@ export class TaskOrchestrator {
     private readonly workspaceManager: WorkspaceManager,
     private readonly logger: Logger,
     private readonly maxRetries = 2,
-    private readonly stepTimeoutMs = 300_000
+    private readonly stepTimeoutMs = 300_000,
+    private readonly browserSessionRepository?: BrowserSessionRepository
   ) {}
 
   private async recordEvent(
@@ -1389,6 +1395,9 @@ export class TaskOrchestrator {
     if (taskClass === TaskClass.ResearchBrowser) {
       return 75;
     }
+    if (taskClass === TaskClass.WideResearch) {
+      return 80;
+    }
     if (taskClass === TaskClass.ActionExecution) {
       return 80;
     }
@@ -1401,11 +1410,24 @@ export class TaskOrchestrator {
       ...(Array.isArray(structured["sources"]) ? { sources: structured["sources"] } : {}),
       ...(Array.isArray(structured["sourceTiers"]) ? { sourceTiers: structured["sourceTiers"] } : {}),
       ...(Array.isArray(structured["findings"]) ? { findings: structured["findings"] } : {}),
+      ...(Array.isArray(structured["subqueryResults"])
+        ? { subqueryResults: structured["subqueryResults"] }
+        : {}),
       ...(Array.isArray(structured["timelineEvents"])
         ? { timelineEvents: structured["timelineEvents"] }
         : {}),
       ...(Array.isArray(structured["extractedFacts"])
         ? { extractedFacts: structured["extractedFacts"] }
+        : {}),
+      ...(Array.isArray(structured["evidencePoints"])
+        ? { evidencePoints: structured["evidencePoints"] }
+        : {}),
+      ...(Array.isArray(structured["attemptSummaries"])
+        ? { attemptSummaries: structured["attemptSummaries"] }
+        : {}),
+      ...(Array.isArray(structured["captures"]) ? { captures: structured["captures"] } : {}),
+      ...(Array.isArray(structured["pageQualitySignals"])
+        ? { pageQualitySignals: structured["pageQualitySignals"] }
         : {}),
       ...(Array.isArray(structured["generatedFiles"])
         ? { generatedFiles: structured["generatedFiles"] }
@@ -1423,10 +1445,126 @@ export class TaskOrchestrator {
     };
   }
 
+  private async persistWideResearchForStep(
+    task: Task,
+    step: Task["steps"][number]
+  ): Promise<void> {
+    const structured = asJsonObject(step.structuredData);
+    const searchQueries = Array.isArray(structured["searchQueries"])
+      ? structured["searchQueries"].map((item) => String(item)).filter(Boolean)
+      : [];
+    const subqueryResults = Array.isArray(structured["subqueryResults"])
+      ? structured["subqueryResults"].map((item) => asJsonObject(item))
+      : [];
+    const sources = Array.isArray(structured["sources"]) ? structured["sources"] : [];
+    if (
+      searchQueries.length === 0 &&
+      subqueryResults.length === 0 &&
+      step.taskClass !== TaskClass.WideResearch
+    ) {
+      return;
+    }
+
+    const existing = await this.wideResearchRunRepository.getByStep(task.id, step.id);
+    const runId = existing?.id ?? createId("widerun");
+    const items = searchQueries.map((query, index): {
+      id: string;
+      wideResearchRunId: string;
+      taskId: string;
+      stepId: string;
+      orderIndex: number;
+      query: string;
+      title?: string;
+      status: "COMPLETED" | "FAILED";
+      sourceCount?: number;
+      summary?: string;
+      errorMessage?: string;
+      metadata: JsonObject;
+      createdAt: string;
+      updatedAt: string;
+    } => {
+      const result = subqueryResults[index] ?? {};
+      const sourceCount =
+        typeof result["sourceCount"] === "number"
+          ? Number(result["sourceCount"])
+          : Array.isArray(result["sources"])
+            ? result["sources"].length
+            : 0;
+      const failed = sourceCount <= 0 && step.status !== StepStatus.Completed;
+      return {
+        id: `${runId}:item:${index + 1}`,
+        wideResearchRunId: runId,
+        taskId: task.id,
+        stepId: step.id,
+        orderIndex: index,
+        query,
+        ...(typeof result["title"] === "string" ? { title: String(result["title"]) } : {}),
+        status: failed ? "FAILED" : "COMPLETED",
+        ...(sourceCount > 0 ? { sourceCount } : {}),
+        ...(typeof result["summary"] === "string"
+          ? { summary: String(result["summary"]) }
+          : typeof result["snippet"] === "string"
+            ? { summary: String(result["snippet"]).slice(0, 280) }
+            : {}),
+        ...(failed ? { errorMessage: "No source evidence returned for subquery" } : {}),
+        metadata: {
+          ...result,
+          query
+        },
+        createdAt: existing?.createdAt ?? nowIso(),
+        updatedAt: nowIso()
+      };
+    });
+
+    const completedItems = items.filter((item) => item.status === "COMPLETED").length;
+    const failedItems = items.length - completedItems;
+
+    await this.wideResearchRunRepository.save({
+      id: runId,
+      taskId: task.id,
+      stepId: step.id,
+      planVersion: task.currentPlanVersion,
+      goal: task.goal,
+      status: failedItems > 0 && completedItems === 0 ? "FAILED" : "COMPLETED",
+      totalItems: items.length || subqueryResults.length || 1,
+      completedItems,
+      failedItems,
+      ...(sources.length > 0 ? { aggregatedSourceCount: sources.length } : {}),
+      metadata: {
+        taskClass: step.taskClass ?? TaskClass.WideResearch,
+        searchQueries,
+        ...(structured["wideResearch"] === true ? { wideResearch: true } : {})
+      },
+      createdAt: existing?.createdAt ?? nowIso(),
+      updatedAt: nowIso()
+    });
+    if (items.length > 0) {
+      await this.wideResearchItemRepository.replaceForRun(runId, items);
+    }
+    await this.recordEvent(
+      task.id,
+      TaskEventKind.WideResearchUpdated,
+      `Wide research run updated for ${step.id}`,
+      {
+        stepId: step.id,
+        runId,
+        totalItems: items.length || subqueryResults.length || 1,
+        completedItems,
+        failedItems,
+        aggregatedSourceCount: sources.length
+      },
+      {
+        stepId: step.id
+      }
+    );
+  }
+
   private async persistKnowledgeForStep(task: Task, step: Task["steps"][number]): Promise<void> {
     if (step.status !== StepStatus.Completed) {
       return;
     }
+
+    await this.persistWideResearchForStep(task, step);
 
     const taskClass = step.taskClass;
     const qualityThreshold = this.getQualityThreshold(taskClass);
@@ -1781,6 +1919,8 @@ export const buildDemoRuntime = (
     taskSummaryRepository,
     artifactIndexRepository,
     taskReferenceRepository,
+    wideResearchRunRepository,
+    wideResearchItemRepository,
     approvalRequestRepository,
     checkpointRepository,
     taskJobRepository,
@@ -1886,7 +2026,8 @@ export const buildDemoRuntime = (
     artifactRegistry,
     toolCallRepository,
     taskEventRepository,
-    logger
+    logger,
+    repositories.browserSessionRepository
   );
 
   const routerAgent = new RouterAgent(modelRouter, openAiClient, agentMode);
@@ -1926,6 +2067,8 @@ export const buildDemoRuntime = (
       taskSummaryRepository,
       artifactIndexRepository,
       taskReferenceRepository,
+      wideResearchRunRepository,
+      wideResearchItemRepository,
       approvalRequestRepository,
       checkpointManager,
       userProfileRepository,
@@ -1934,7 +2077,8 @@ export const buildDemoRuntime = (
       workspaceManager,
       logger,
       2,
-      Number(process.env.OPENCLAW_STEP_TIMEOUT_MS ?? 300_000)
+      Number(process.env.OPENCLAW_STEP_TIMEOUT_MS ?? 300_000),
+      repositories.browserSessionRepository
     ),
     taskRepository,
     taskEventRepository,
@@ -1942,6 +2086,9 @@ export const buildDemoRuntime = (
     taskSummaryRepository,
     artifactIndexRepository,
     taskReferenceRepository,
+    wideResearchRunRepository,
+    wideResearchItemRepository,
+    browserSessionRepository: repositories.browserSessionRepository,
     toolCallRepository,
     approvalRequestRepository,
     checkpointRepository,

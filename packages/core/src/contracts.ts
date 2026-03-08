@@ -22,7 +22,10 @@ import {
   TaskSummary,
   TaskStep,
   ToolCall,
-  UserProfile
+  UserProfile,
+  WideResearchItem,
+  WideResearchRun,
+  BrowserSession
 } from "./domain";
 
 export interface AgentRequest {
@@ -143,6 +146,25 @@ export interface ArtifactIndexRepository {
 export interface TaskReferenceRepository {
   save(reference: TaskReference): Promise<TaskReference>;
   listByTask(taskId: string): Promise<TaskReference[]>;
+}
+
+export interface WideResearchRunRepository {
+  save(run: WideResearchRun): Promise<WideResearchRun>;
+  getByStep(taskId: string, stepId: string): Promise<WideResearchRun | undefined>;
+  listByTask(taskId: string): Promise<WideResearchRun[]>;
+}
+
+export interface WideResearchItemRepository {
+  save(item: WideResearchItem): Promise<WideResearchItem>;
+  replaceForRun(wideResearchRunId: string, items: WideResearchItem[]): Promise<WideResearchItem[]>;
+  listByRun(wideResearchRunId: string): Promise<WideResearchItem[]>;
+}
+
+export interface BrowserSessionRepository {
+  save(session: BrowserSession): Promise<BrowserSession>;
+  getByProfileId(browserProfileId: string): Promise<BrowserSession | undefined>;
+  listRecent(limit?: number): Promise<BrowserSession[]>;
+  listByTask(taskId: string): Promise<BrowserSession[]>;
 }
 
 export interface UserProfileRepository {

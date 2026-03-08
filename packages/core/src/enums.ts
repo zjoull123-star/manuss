@@ -37,6 +37,7 @@ export enum AgentKind {
 
 export enum TaskClass {
   ResearchBrowser = "research_browser",
+  WideResearch = "wide_research",
   CodingPython = "coding_python",
   DocumentExport = "document_export",
   ActionExecution = "action_execution"
@@ -127,6 +128,8 @@ export enum TaskEventKind {
   AttemptEscalated = "attempt_escalated",
   StaleJobReclaimed = "stale_job_reclaimed",
   ArtifactValidated = "artifact_validated",
+  WideResearchUpdated = "wide_research_updated",
+  BrowserSessionUpdated = "browser_session_updated",
   TaskReferenced = "task_referenced",
   BenchmarkRun = "benchmark_run"
 }
