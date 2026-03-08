@@ -30,6 +30,14 @@ const inferArtifactType = (uri: string): ArtifactType => {
     return ArtifactType.Pdf;
   }
 
+  if (extension === ".docx") {
+    return ArtifactType.Document;
+  }
+
+  if (extension === ".pptx") {
+    return ArtifactType.Presentation;
+  }
+
   if (extension === ".csv" || extension === ".tsv" || extension === ".xlsx" || extension === ".xls") {
     return ArtifactType.Spreadsheet;
   }

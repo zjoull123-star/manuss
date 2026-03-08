@@ -11,6 +11,7 @@ model TaskRecord {
   id                 String             @id
   userId             String
   goal               String
+  recipeId           String?
   status             String
   createdAt          DateTime
   updatedAt          DateTime
@@ -18,6 +19,7 @@ model TaskRecord {
   planJson           String
   originJson         String?
   finalArtifactUri   String?
+  finalArtifactValidationJson String?
   retryOfTaskId      String?
   cancelRequestedAt  DateTime?
   steps              TaskStepRecord[]
@@ -28,6 +30,10 @@ model TaskRecord {
   jobs               TaskJobRecord[]
   events             TaskEventRecord[]
   memories           MemoryRecordModel[]
+  summaries          TaskSummaryRecord[]
+  references         TaskReferenceRecord[]
+  artifactIndexes    ArtifactIndexRecord[]
+  benchmarkItems     BenchmarkRunItemRecord[]
 
   @@index([userId])
 }
@@ -50,6 +56,9 @@ model TaskStepRecord {
   orderIndex         Int
   title              String
   agent              String
+  taskClass          String?
+  qualityProfileJson String?
+  attemptStrategyJson String?
   objective          String
   dependsOnJson      String
   status             String
@@ -59,6 +68,14 @@ model TaskStepRecord {
   inputArtifactsJson String
   outputArtifactsJson String
   structuredDataJson String
+  evidencePackageJson String?
+  qualityScore       Float?
+  qualityDefectsJson String?
+  missingEvidenceJson String?
+  sourceCoverageScore Float?
+  formatCompliance   String?
+  attemptHistoryJson String?
+  referenceArtifactIdsJson String?
   errorJson          String?
   task               TaskRecord @relation(fields: [taskId], references: [id], onDelete: Cascade)
 
@@ -86,9 +103,15 @@ model ArtifactRecord {
   stepId       String?
   type         String
   uri          String
+  title        String?
+  summary      String?
+  keywordsJson String?
+  validated    Boolean?
+  deliveryKind String?
   metadataJson String
   createdAt    DateTime
   task         TaskRecord @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  indexedEntries ArtifactIndexRecord[]
 
   @@index([taskId, createdAt])
 }
@@ -170,4 +193,91 @@ model TaskEventRecord {
 
   @@index([taskId, createdAt])
   @@index([kind, createdAt])
+}
+
+model TaskSummaryRecord {
+  id        String   @id
+  taskId    String
+  userId    String
+  taskClass String?
+  recipeId  String?
+  summary   String
+  keywordsJson String
+  validated Boolean
+  createdAt DateTime
+  task      TaskRecord @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@index([taskId, createdAt])
+  @@index([userId, createdAt])
+  @@index([taskClass, validated, createdAt])
+}
+
+model ArtifactIndexRecord {
+  id          String   @id
+  taskId      String
+  stepId      String?
+  artifactId  String
+  artifactType String
+  uri         String
+  title       String?
+  summary     String?
+  keywordsJson String
+  validated   Boolean
+  taskClass   String?
+  recipeId    String?
+  createdAt   DateTime
+  task        TaskRecord @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  artifact    ArtifactRecord @relation(fields: [artifactId], references: [id], onDelete: Cascade)
+
+  @@index([taskId, createdAt])
+  @@index([artifactType, validated, createdAt])
+  @@index([taskClass, validated, createdAt])
+}
+
+model TaskReferenceRecord {
+  id             String   @id
+  taskId         String
+  sourceTaskId   String?
+  sourceArtifactId String?
+  reason         String
+  metadataJson   String
+  createdAt      DateTime
+  task           TaskRecord @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@index([taskId, createdAt])
+}
+
+model BenchmarkRunRecord {
+  id          String   @id
+  name        String
+  suite       String
+  status      String
+  startedAt   DateTime
+  completedAt DateTime?
+  createdAt   DateTime
+  metadataJson String
+  items       BenchmarkRunItemRecord[]
+
+  @@index([createdAt])
+  @@index([suite, createdAt])
+}
+
+model BenchmarkRunItemRecord {
+  id              String   @id
+  benchmarkRunId  String
+  caseId          String
+  taskId          String?
+  completed       Boolean
+  qualityScore    Float?
+  fallbackUsed    Boolean
+  artifactValidated Boolean
+  latencyMs       Int?
+  failureCategory String?
+  createdAt       DateTime
+  metadataJson    String
+  run             BenchmarkRunRecord @relation(fields: [benchmarkRunId], references: [id], onDelete: Cascade)
+  task            TaskRecord? @relation(fields: [taskId], references: [id], onDelete: SetNull)
+
+  @@index([benchmarkRunId, createdAt])
+  @@index([caseId, createdAt])
 }

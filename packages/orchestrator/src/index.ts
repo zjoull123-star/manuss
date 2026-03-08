@@ -3,10 +3,14 @@ import { promises as fs } from "node:fs";
 import {
   AgentRequest,
   AgentResponse,
+  AgentKind,
   ApprovalRequest,
   ApprovalRequestRepository,
   ApprovalStatus,
+  ArtifactType,
   ArtifactRepository,
+  ArtifactIndexEntry,
+  ArtifactIndexRepository,
   Checkpoint,
   CheckpointRepository,
   createTaskEvent,
@@ -14,10 +18,12 @@ import {
   createDraftTask,
   createTaskFromPlan,
   ErrorCode,
+  DeliveryKind,
   isRunnableStep,
   RouteDecision,
   StepStatus,
   Task,
+  TaskClass,
   TaskEventKind,
   TaskEventRepository,
   TaskJob,
@@ -25,6 +31,8 @@ import {
   TaskJobKind,
   TaskJobRepository,
   TaskRepository,
+  TaskReferenceRepository,
+  TaskSummaryRepository,
   TaskStatus,
   ToolName,
   UserProfile,
@@ -41,6 +49,7 @@ import {
   CodingAgent,
   hasTaskPrefix,
   PlannerAgent,
+  ReplannerAgent,
   ResearchAgent,
   RouterAgent,
   VerifierAgent
@@ -66,6 +75,7 @@ import { ToolPolicyService } from "../../policy/src";
 import { ConsoleLogger, StructuredLogger } from "../../observability/src";
 import { DocumentAgent } from "../../agents/src";
 import { InMemoryMemoryStore, PersistentMemoryStore } from "../../memory/src";
+import { buildRecipePlanningContext, matchRecipeForGoal } from "../../recipes/src";
 
 const asString = (value: unknown): string | undefined =>
   typeof value === "string" && value.length > 0 ? value : undefined;
@@ -161,6 +171,58 @@ const pickPreferredFinalArtifact = (artifactUris: string[]): string | undefined 
   return artifactUris.at(-1);
 };
 
+const getMaxRetriesForAgent = (agent: AgentKind): number => {
+  if (agent === AgentKind.Research || agent === AgentKind.Browser) {
+    return 3;
+  }
+  if (agent === AgentKind.Action) {
+    return 1;
+  }
+  return 2;
+};
+
+const getStepTimeoutForAgent = (agent: AgentKind, fallbackMs: number): number => {
+  if (agent === AgentKind.Research || agent === AgentKind.Browser) {
+    return 600_000;
+  }
+  return fallbackMs;
+};
+
+const buildRuntimeAttemptStrategy = (
+  step: Task["steps"][number],
+  attempt: number,
+  timeoutMs: number
+): JsonObject => ({
+  ...(step.attemptStrategy ?? {}),
+  attempt,
+  timeoutMs,
+  maxRetries: getMaxRetriesForAgent(step.agent),
+  strategy:
+    attempt <= 0
+      ? "default_execution"
+      : attempt === 1
+        ? "repair_context_and_retry"
+        : attempt === 2
+          ? "escalate_model_or_tool"
+      : "fallback_or_replan",
+  escalatedModel:
+    attempt >= 1 &&
+    [AgentKind.Research, AgentKind.Browser, AgentKind.Document, AgentKind.Verifier].includes(
+      step.agent
+    )
+});
+
+const uniqueStrings = (values: string[]): string[] => [...new Set(values.filter(Boolean))];
+
+const tokenizeKeywords = (value: string): string[] =>
+  uniqueStrings(
+    value
+      .toLowerCase()
+      .split(/[^\p{L}\p{N}]+/u)
+      .map((token) => token.trim())
+      .filter((token) => token.length >= 2)
+  );
+
 export class Scheduler {
   pickNextRunnableStep(task: Task) {
     return task.steps.find((step) => isRunnableStep(task, step));
@@ -190,6 +252,7 @@ export interface HandleGoalInput {
   userId: string;
   goal: string;
   origin?: TaskOrigin;
+  recipeId?: string;
 }
 
 export class TaskOrchestrator {
@@ -198,12 +261,16 @@ export class TaskOrchestrator {
   constructor(
     private readonly routerAgent: RouterAgent,
     private readonly plannerAgent: PlannerAgent,
+    private readonly replannerAgent: ReplannerAgent,
     private readonly verifierAgent: VerifierAgent,
     private readonly agentRegistry: AgentRegistry,
     private readonly taskRepository: TaskRepository,
     private readonly taskEventRepository: TaskEventRepository,
     private readonly taskJobRepository: TaskJobRepository,
     private readonly artifactRepository: ArtifactRepository,
+    private readonly taskSummaryRepository: TaskSummaryRepository,
+    private readonly artifactIndexRepository: ArtifactIndexRepository,
+    private readonly taskReferenceRepository: TaskReferenceRepository,
     private readonly approvalRequestRepository: ApprovalRequestRepository,
     private readonly checkpointManager: CheckpointManager,
     private readonly userProfileRepository: UserProfileRepository,
@@ -260,6 +327,11 @@ export class TaskOrchestrator {
         status: step.status,
         agent: step.agent,
         retryCount: step.retryCount,
+        ...(step.taskClass ? { taskClass: step.taskClass } : {}),
+        ...(typeof step.qualityScore === "number" ? { qualityScore: step.qualityScore } : {}),
+        ...(Array.isArray(step.qualityDefects) ? { qualityDefects: step.qualityDefects } : {}),
+        ...(Array.isArray(step.missingEvidence) ? { missingEvidence: step.missingEvidence } : {}),
+        ...(step.attemptStrategy ? { attemptStrategy: step.attemptStrategy } : {}),
         ...(step.error
           ? {
               error: {
@@ -332,6 +404,7 @@ export class TaskOrchestrator {
     }
 
     const retryTask = createDraftTask(sourceTask.userId, sourceTask.goal, sourceTask.origin, {
+      ...(sourceTask.recipeId ? { recipeId: sourceTask.recipeId } : {}),
       retryOfTaskId: sourceTask.id
     });
     await this.taskRepository.create(retryTask);
@@ -427,7 +500,9 @@ export class TaskOrchestrator {
   }
 
   async createDraftTask(input: HandleGoalInput): Promise<Task> {
-    const task = createDraftTask(input.userId, input.goal, input.origin);
+    const task = createDraftTask(input.userId, input.goal, input.origin, {
+      ...(input.recipeId ? { recipeId: input.recipeId } : {})
+    });
     await this.taskRepository.create(task);
     await this.recordTaskStatus(task, "Task created");
     await this.saveCheckpointAndEvent(task);
@@ -490,9 +565,26 @@ export class TaskOrchestrator {
       this.assertTaskRoute(routeDecision.effective);
 
       failureStage = "planner";
+      const matchedRecipe = existingTask.recipeId
+        ? existingTask.recipeId
+        : matchRecipeForGoal(normalizedGoal)?.id;
+      const historicalContext = await this.contextBuilder.buildHistoricalContext(
+        {
+          id: existingTask.id,
+          userId: existingTask.userId,
+          goal: normalizedGoal,
+          ...(matchedRecipe ? { recipeId: matchedRecipe } : {})
+        },
+        undefined
+      );
       const plan = await this.plannerAgent.createPlan(
         normalizedGoal,
-        this.contextBuilder.buildPlanningContext(normalizedGoal, userProfile)
+        {
+          ...this.contextBuilder.buildPlanningContext(normalizedGoal, userProfile),
+          ...historicalContext.planningContext,
+          ...(matchedRecipe ? { recipeId: matchedRecipe } : {}),
+          ...buildRecipePlanningContext(matchedRecipe)
+        }
       );
       const task = createTaskFromPlan(
         existingTask.userId,
@@ -500,6 +592,7 @@ export class TaskOrchestrator {
         plan,
         existingTask.origin,
         {
+          ...(matchedRecipe ? { recipeId: matchedRecipe } : {}),
           ...(existingTask.retryOfTaskId ? { retryOfTaskId: existingTask.retryOfTaskId } : {}),
           ...(existingTask.cancelRequestedAt
             ? { cancelRequestedAt: existingTask.cancelRequestedAt }
@@ -510,6 +603,19 @@ export class TaskOrchestrator {
       task.createdAt = existingTask.createdAt;
       task.updatedAt = nowIso();
       await this.taskRepository.update(task);
+      for (const reference of historicalContext.references) {
+        await this.recordEvent(
+          task.id,
+          TaskEventKind.TaskReferenced,
+          `Historical reference attached: ${reference.reason}`,
+          {
+            referenceId: reference.id,
+            reason: reference.reason,
+            sourceTaskId: reference.sourceTaskId ?? null,
+            sourceArtifactId: reference.sourceArtifactId ?? null
+          }
+        );
+      }
       await this.recordTaskStatus(task, "Task planned");
       await this.saveCheckpointAndEvent(task);
 
@@ -629,6 +735,10 @@ export class TaskOrchestrator {
       if (finalArtifact) {
         currentTask.finalArtifactUri = finalArtifact;
       }
+      const finalArtifactValidation = this.buildFinalArtifactValidation(currentTask);
+      if (finalArtifactValidation) {
+        currentTask.finalArtifactValidation = finalArtifactValidation;
+      }
     } else if (currentTask.steps.some((step) => step.status === StepStatus.WaitingApproval)) {
       currentTask.status = TaskStatus.WaitingApproval;
     } else if (currentTask.steps.some((step) => step.status === StepStatus.Failed)) {
@@ -639,6 +749,23 @@ export class TaskOrchestrator {
 
     currentTask.updatedAt = nowIso();
     await this.taskRepository.update(currentTask);
+    if (currentTask.status === TaskStatus.Completed) {
+      await this.taskSummaryRepository.save({
+        id: `${currentTask.id}:final`,
+        taskId: currentTask.id,
+        userId: currentTask.userId,
+        summary:
+          currentTask.steps
+            .map((step) => step.summary)
+            .filter((summary): summary is string => typeof summary === "string" && summary.length > 0)
+            .slice(-3)
+            .join(" | ") || currentTask.goal,
+        keywords: tokenizeKeywords(currentTask.goal),
+        validated: Boolean(currentTask.finalArtifactUri),
+        createdAt: nowIso(),
+        ...(currentTask.recipeId ? { recipeId: currentTask.recipeId } : {})
+      });
+    }
     await this.recordTaskStatus(currentTask, `Task ${currentTask.status.toLowerCase()}`);
     await this.saveCheckpointAndEvent(currentTask);
     return currentTask;
@@ -656,8 +783,10 @@ export class TaskOrchestrator {
     }
 
     const stepLogger = this.logger.child({ taskId: working.id, stepId });
+    const maxRetries = getMaxRetriesForAgent(step.agent);
+    const stepTimeoutMs = getStepTimeoutForAgent(step.agent, this.stepTimeoutMs);
     let attempt = step.retryCount;
-    while (attempt <= this.maxRetries) {
+    while (attempt <= maxRetries) {
       const cancelledBeforeAttempt = await this.maybeCancelTask(
         working.id,
         `Task cancelled before starting ${step.id}`,
@@ -668,6 +797,8 @@ export class TaskOrchestrator {
       }
 
       step.status = StepStatus.Running;
+      step.attemptStrategy = buildRuntimeAttemptStrategy(step, attempt, stepTimeoutMs);
+      step.attemptHistory = [...(step.attemptHistory ?? []), step.attemptStrategy];
       working.status = attempt === 0 ? TaskStatus.Running : TaskStatus.Retrying;
       working.updatedAt = nowIso();
       await this.taskRepository.update(working);
@@ -684,7 +815,36 @@ export class TaskOrchestrator {
         working.id,
         step.id
       );
-      const context = this.contextBuilder.buildStepContext(working, step, userProfile, artifacts);
+      const historicalContext = await this.contextBuilder.buildHistoricalContext(
+        {
+          id: working.id,
+          userId: working.userId,
+          goal: working.goal,
+          ...(working.recipeId ? { recipeId: working.recipeId } : {})
+        },
+        step.taskClass
+      );
+      for (const reference of historicalContext.references) {
+        await this.recordEvent(
+          working.id,
+          TaskEventKind.TaskReferenced,
+          `Reference attached during ${step.id}: ${reference.reason}`,
+          {
+            referenceId: reference.id,
+            sourceTaskId: reference.sourceTaskId ?? null,
+            sourceArtifactId: reference.sourceArtifactId ?? null,
+            reason: reference.reason
+          },
+          { stepId: step.id }
+        );
+      }
+      const context = this.contextBuilder.buildStepContext(
+        working,
+        step,
+        userProfile,
+        artifacts,
+        historicalContext.planningContext
+      );
       const approvalPayload = asJsonObject(latestApproval?.payload);
       if (latestApproval) {
         context["approvalStatus"] = latestApproval.status;
@@ -704,7 +864,7 @@ export class TaskOrchestrator {
 
       let response: AgentResponse;
       try {
-        response = await this.executeAgentWithTimeout(step.agent, request, this.stepTimeoutMs);
+        response = await this.executeAgentWithTimeout(step.agent, request, stepTimeoutMs);
       } catch (timeoutError) {
         if (timeoutError instanceof StepTimeoutError) {
           step.status = StepStatus.Failed;
@@ -716,14 +876,14 @@ export class TaskOrchestrator {
           working.status = TaskStatus.Failed;
           working.updatedAt = nowIso();
           await this.taskRepository.update(working);
-          stepLogger.error("Step execution timeout", { timeoutMs: this.stepTimeoutMs });
+          stepLogger.error("Step execution timeout", { timeoutMs: stepTimeoutMs });
           await this.recordStepStatus(working.id, step, `Step ${step.id} timed out`, "error");
           await this.recordTaskStatus(working, `Task failed: step ${step.id} timed out`);
           await this.recordEvent(
             working.id,
             TaskEventKind.Error,
-            `Step ${step.id} execution timed out after ${this.stepTimeoutMs}ms`,
-            { timeoutMs: this.stepTimeoutMs },
+            `Step ${step.id} execution timed out after ${stepTimeoutMs}ms`,
+            { timeoutMs: stepTimeoutMs },
             { stepId: step.id, level: "error" }
           );
           await this.saveCheckpointAndEvent(working, step.id);
@@ -732,6 +892,30 @@ export class TaskOrchestrator {
         throw timeoutError;
       }
       this.applyStepResponse(step, response);
+      step.evidencePackage = this.buildEvidencePackage(step);
+      if (
+        response.structuredData &&
+        ((response.structuredData["llmFallbackUsed"] as boolean | undefined) === true ||
+          (response.structuredData["synthesisFallbackUsed"] as boolean | undefined) === true)
+      ) {
+        await this.recordEvent(
+          working.id,
+          TaskEventKind.RecoveryFallbackUsed,
+          `Fallback used during ${step.id}`,
+          {
+            agent: step.agent,
+            fallbackKind:
+              String(
+                response.structuredData["fallbackKind"] ??
+                  response.structuredData["llmFallbackCategory"] ??
+                  response.structuredData["synthesisFallbackReason"] ??
+                  "unknown"
+              ),
+            attempt
+          },
+          { stepId: step.id, level: "warn" }
+        );
+      }
       const cancelledAfterAgent = await this.maybeCancelTask(
         working.id,
         `Task cancelled during ${step.id}`,
@@ -766,6 +950,41 @@ export class TaskOrchestrator {
       await this.recordTaskStatus(working, `Task verifying ${step.id}`);
 
       const decision = await this.verifierAgent.verifyStep(working, step, response);
+      if (typeof decision.qualityScore === "number") {
+        step.qualityScore = decision.qualityScore;
+      }
+      if (Array.isArray(decision.qualityDefects)) {
+        step.qualityDefects = decision.qualityDefects;
+      }
+      if (Array.isArray(decision.missingEvidence)) {
+        step.missingEvidence = decision.missingEvidence;
+      }
+      if (typeof decision.sourceCoverageScore === "number") {
+        step.sourceCoverageScore = decision.sourceCoverageScore;
+      }
+      if (typeof decision.formatCompliance === "string") {
+        step.formatCompliance = decision.formatCompliance;
+      }
+
+      if (
+        decision.verdict !== "pass" &&
+        ((Array.isArray(decision.qualityDefects) && decision.qualityDefects.length > 0) ||
+          (Array.isArray(decision.missingEvidence) && decision.missingEvidence.length > 0))
+      ) {
+        await this.recordEvent(
+          working.id,
+          TaskEventKind.QualityGateFailed,
+          `Quality gate failed for ${step.id}`,
+          {
+            qualityScore: decision.qualityScore ?? null,
+            qualityDefects: decision.qualityDefects ?? [],
+            missingEvidence: decision.missingEvidence ?? [],
+            sourceCoverageScore: decision.sourceCoverageScore ?? null,
+            formatCompliance: decision.formatCompliance ?? null
+          },
+          { stepId: step.id, level: "warn" }
+        );
+      }
       if (decision.verdict === "pass") {
         step.status = StepStatus.Completed;
         delete step.error;
@@ -773,16 +992,31 @@ export class TaskOrchestrator {
         await this.markApprovalExecutedIfNeeded(working.id, step.id);
         this.memoryWriter.recordStepResult(working, step);
         await this.taskRepository.update(working);
+        await this.persistKnowledgeForStep(working, step);
+        if (
+          response.structuredData &&
+          typeof response.structuredData["artifactValidation"] === "object" &&
+          response.structuredData["artifactValidation"] !== null
+        ) {
+          await this.recordEvent(
+            working.id,
+            TaskEventKind.ArtifactValidated,
+            `Artifact validation captured for ${step.id}`,
+            response.structuredData["artifactValidation"] as JsonObject,
+            { stepId: step.id }
+          );
+        }
         await this.recordStepStatus(working.id, step, `Step ${step.id} completed`);
         await this.recordTaskStatus(working, `Task running after ${step.id}`);
         await this.saveCheckpointAndEvent(working, step.id);
         return working;
       }
 
-      if (decision.verdict === "retry_step" && attempt < this.maxRetries) {
+      if (decision.verdict === "retry_step" && attempt < maxRetries) {
         attempt += 1;
         step.retryCount = attempt;
         step.status = StepStatus.Pending;
+        step.attemptStrategy = buildRuntimeAttemptStrategy(step, attempt, stepTimeoutMs);
         working.status = TaskStatus.Retrying;
         stepLogger.warn("Retrying step", {
           attempt,
@@ -795,9 +1029,29 @@ export class TaskOrchestrator {
           stage: "verification",
           category: "retry_step"
         };
+        await this.recordEvent(
+          working.id,
+          TaskEventKind.AttemptEscalated,
+          `Escalating retry strategy for ${step.id}`,
+          {
+            attempt,
+            agent: step.agent,
+            strategy: step.attemptStrategy
+          },
+          { stepId: step.id, level: "warn" }
+        );
         await this.recordStepStatus(working.id, step, `Step ${step.id} retry requested`, "warn");
         await this.recordTaskStatus(working, `Task retrying ${step.id}`);
         continue;
+      }
+
+      if (decision.verdict === "replan_task") {
+        return this.partialReplanTask(
+          working,
+          step,
+          userProfile,
+          decision.reason || "verifier requested replan"
+        );
       }
 
       step.status =
@@ -832,7 +1086,10 @@ export class TaskOrchestrator {
           verdict: decision.verdict,
           reason: decision.reason,
           missingCriteria: decision.missingCriteria,
-          suggestedFix: decision.suggestedFix
+          suggestedFix: decision.suggestedFix,
+          qualityScore: decision.qualityScore ?? null,
+          qualityDefects: decision.qualityDefects ?? [],
+          missingEvidence: decision.missingEvidence ?? []
         },
         {
           stepId: step.id,
@@ -841,6 +1098,15 @@ export class TaskOrchestrator {
       );
       await this.saveCheckpointAndEvent(working, step.id);
       return working;
+    }
+
+    if ([AgentKind.Research, AgentKind.Browser].includes(step.agent)) {
+      return this.partialReplanTask(
+        working,
+        step,
+        userProfile,
+        "retry budget exhausted"
+      );
     }
 
     step.status = StepStatus.Failed;
@@ -1118,6 +1384,220 @@ export class TaskOrchestrator {
       }
     );
   }
+
+  private getQualityThreshold(taskClass?: TaskClass): number {
+    if (taskClass === TaskClass.ResearchBrowser) {
+      return 75;
+    }
+    if (taskClass === TaskClass.ActionExecution) {
+      return 80;
+    }
+    return 80;
+  }
+
+  private buildEvidencePackage(step: Task["steps"][number]): JsonObject {
+    const structured = asJsonObject(step.structuredData);
+    return {
+      ...(Array.isArray(structured["sources"]) ? { sources: structured["sources"] } : {}),
+      ...(Array.isArray(structured["sourceTiers"]) ? { sourceTiers: structured["sourceTiers"] } : {}),
+      ...(Array.isArray(structured["findings"]) ? { findings: structured["findings"] } : {}),
+      ...(Array.isArray(structured["timelineEvents"])
+        ? { timelineEvents: structured["timelineEvents"] }
+        : {}),
+      ...(Array.isArray(structured["extractedFacts"])
+        ? { extractedFacts: structured["extractedFacts"] }
+        : {}),
+      ...(Array.isArray(structured["generatedFiles"])
+        ? { generatedFiles: structured["generatedFiles"] }
+        : {}),
+      ...(typeof structured["reportPreview"] === "string"
+        ? { reportPreview: structured["reportPreview"] }
+        : {}),
+      ...(Array.isArray(structured["keySections"])
+        ? { keySections: structured["keySections"] }
+        : {}),
+      ...(typeof structured["artifactValidation"] === "object" &&
+      structured["artifactValidation"] !== null
+        ? { artifactValidation: structured["artifactValidation"] }
+        : {})
+    };
+  }
+
+  private async persistKnowledgeForStep(task: Task, step: Task["steps"][number]): Promise<void> {
+    if (step.status !== StepStatus.Completed) {
+      return;
+    }
+
+    const taskClass = step.taskClass;
+    const qualityThreshold = this.getQualityThreshold(taskClass);
+    const validated =
+      typeof step.qualityScore === "number"
+        ? step.qualityScore >= qualityThreshold
+        : !step.error;
+    const summaryKeywords = tokenizeKeywords(
+      [task.goal, step.title, step.summary ?? "", step.objective].join(" ")
+    );
+
+    await this.taskSummaryRepository.save({
+      id: `${task.id}:${step.id}`,
+      taskId: task.id,
+      userId: task.userId,
+      ...(taskClass ? { taskClass } : {}),
+      ...(task.recipeId ? { recipeId: task.recipeId } : {}),
+      summary: step.summary ?? step.title,
+      keywords: summaryKeywords,
+      validated,
+      createdAt: nowIso()
+    });
+
+    const artifacts = await this.artifactRepository.listByTask(task.id);
+    const outputArtifactSet = new Set(step.outputArtifacts);
+    const candidateArtifacts = artifacts.filter((artifact) => outputArtifactSet.has(artifact.uri));
+    for (const artifact of candidateArtifacts) {
+      const structured = asJsonObject(step.structuredData);
+      const artifactValidation = asJsonObject(structured["artifactValidation"]);
+      const artifactValidated =
+        typeof artifact.validated === "boolean"
+          ? artifact.validated
+          : artifactValidation["validated"] === false
+            ? false
+            : validated;
+      await this.artifactIndexRepository.save({
+        id: `artidx:${artifact.id}`,
+        taskId: task.id,
+        ...(artifact.stepId ? { stepId: artifact.stepId } : {}),
+        artifactId: artifact.id,
+        artifactType: artifact.type,
+        uri: artifact.uri,
+        ...(artifact.title ? { title: artifact.title } : step.summary ? { title: step.title } : {}),
+        ...(artifact.summary
+          ? { summary: artifact.summary }
+          : step.summary
+            ? { summary: step.summary }
+            : {}),
+        keywords: uniqueStrings([
+          ...tokenizeKeywords([task.goal, step.title, step.summary ?? ""].join(" ")),
+          ...(artifact.keywords ?? [])
+        ]),
+        validated: artifactValidated,
+        ...(taskClass ? { taskClass } : {}),
+        ...(task.recipeId ? { recipeId: task.recipeId } : {}),
+        createdAt: artifact.createdAt
+      });
+    }
+  }
+
+  private buildFinalArtifactValidation(task: Task): Task["finalArtifactValidation"] | undefined {
+    const finalStep = [...task.steps].reverse().find((step) => step.outputArtifacts.length > 0);
+    if (!finalStep) {
+      return undefined;
+    }
+    const structured = asJsonObject(finalStep.structuredData);
+    const artifactValidation = asJsonObject(structured["artifactValidation"]);
+    if (Object.keys(artifactValidation).length === 0) {
+      return undefined;
+    }
+    const validation: NonNullable<Task["finalArtifactValidation"]> = {
+      validated: artifactValidation["validated"] !== false,
+      issues: Array.isArray(artifactValidation["issues"])
+        ? artifactValidation["issues"].map((item) => String(item))
+        : []
+    };
+    if (typeof artifactValidation["artifactType"] === "string") {
+      validation.artifactType = artifactValidation["artifactType"] as ArtifactType;
+    }
+    if (typeof artifactValidation["deliveryKind"] === "string") {
+      validation.deliveryKind = artifactValidation["deliveryKind"] as DeliveryKind;
+    }
+    if (typeof artifactValidation["pageCount"] === "number") {
+      validation.pageCount = artifactValidation["pageCount"];
+    }
+    return validation;
+  }
+
+  private async partialReplanTask(
+    task: Task,
+    failedStep: Task["steps"][number],
+    userProfile: UserProfile,
+    reason: string
+  ): Promise<Task> {
+    const working = structuredClone(task);
+    const completedStepIds = new Set(
+      working.steps.filter((step) => step.status === StepStatus.Completed).map((step) => step.id)
+    );
+    const historicalContext = await this.contextBuilder.buildHistoricalContext(
+      {
+        id: working.id,
+        userId: working.userId,
+        goal: working.goal,
+        ...(working.recipeId ? { recipeId: working.recipeId } : {})
+      },
+      failedStep.taskClass
+    );
+    const repairedPlan = await this.replannerAgent.repairPlan(working, failedStep, {
+      ...this.contextBuilder.buildPlanningContext(working.goal, userProfile),
+      ...historicalContext.planningContext,
+      failedStepId: failedStep.id,
+      failedStepSummary: failedStep.summary ?? "",
+      failedStepError: failedStep.error
+        ? JSON.parse(JSON.stringify(failedStep.error)) as JsonObject
+        : null
+    });
+    const preservedPlanSteps = working.plan.steps.filter((step) => completedStepIds.has(step.id));
+    const rebuiltSteps = repairedPlan.steps.map((step) => ({
+      id: step.id,
+      title: step.title,
+      agent: step.agent,
+      ...(step.taskClass ? { taskClass: step.taskClass } : {}),
+      ...(step.qualityProfile ? { qualityProfile: step.qualityProfile } : {}),
+      ...(step.attemptStrategy ? { attemptStrategy: step.attemptStrategy } : {}),
+      objective: step.objective,
+      dependsOn: step.dependsOn,
+      status: StepStatus.Pending,
+      retryCount: 0,
+      successCriteria: step.successCriteria,
+      inputArtifacts: [],
+      outputArtifacts: [],
+      structuredData: {},
+      evidencePackage: {},
+      attemptHistory: [],
+      referenceArtifactIds: historicalContext.references
+        .flatMap((reference) => (reference.sourceArtifactId ? [reference.sourceArtifactId] : []))
+    }));
+    working.plan = {
+      goal: working.goal,
+      assumptions: uniqueStrings([...working.plan.assumptions, ...repairedPlan.assumptions]),
+      steps: [...preservedPlanSteps, ...repairedPlan.steps],
+      taskSuccessCriteria: uniqueStrings([
+        ...working.plan.taskSuccessCriteria,
+        ...repairedPlan.taskSuccessCriteria
+      ])
+    };
+    working.steps = [
+      ...working.steps.filter((step) => completedStepIds.has(step.id)),
+      ...rebuiltSteps
+    ];
+    working.currentPlanVersion += 1;
+    working.status = TaskStatus.Planned;
+    working.updatedAt = nowIso();
+    await this.taskRepository.update(working);
+    await this.recordEvent(
+      working.id,
+      TaskEventKind.AttemptEscalated,
+      `Partial replan applied after ${failedStep.id}`,
+      {
+        failedStepId: failedStep.id,
+        reason,
+        planVersion: working.currentPlanVersion,
+        preservedSteps: [...completedStepIds],
+        newSteps: rebuiltSteps.map((step) => step.id)
+      },
+      { stepId: failedStep.id, level: "warn" }
+    );
+    await this.recordTaskStatus(working, `Task replanned after ${failedStep.id}`);
+    await this.saveCheckpointAndEvent(working, failedStep.id);
+    return working;
+  }
 }
 
 export class TaskQueueWorker {
@@ -1135,6 +1615,24 @@ export class TaskQueueWorker {
     const job = await this.taskJobRepository.claimNext(this.workerId, this.leaseTimeoutMs);
     if (!job) {
       return false;
+    }
+    if (job.payload["reclaimedFromStaleLease"] === true) {
+      await this.taskEventRepository.create(
+        createTaskEvent(
+          job.taskId,
+          TaskEventKind.StaleJobReclaimed,
+          `${job.kind} reclaimed after stale lease`,
+          {
+            kind: job.kind,
+            workerId: this.workerId,
+            attempts: job.attempts
+          },
+          {
+            jobId: job.id,
+            level: "warn"
+          }
+        )
+      );
     }
     await this.taskEventRepository.create(
       createTaskEvent(
@@ -1280,12 +1778,17 @@ export const buildDemoRuntime = (
     taskRepository,
     taskEventRepository,
     artifactRepository,
+    taskSummaryRepository,
+    artifactIndexRepository,
+    taskReferenceRepository,
     approvalRequestRepository,
     checkpointRepository,
     taskJobRepository,
     userProfileRepository,
     toolCallRepository,
     memoryRepository,
+    benchmarkRunRepository,
+    benchmarkRunItemRepository,
     prisma
   } = repositories;
       const workspaceManager = new WorkspaceManager(workspaceRoot);
@@ -1315,7 +1818,44 @@ export const buildDemoRuntime = (
     mode: toolMode,
     ...(process.env.OPENCLAW_ACTION_WEBHOOK_URL
       ? { defaultUrl: process.env.OPENCLAW_ACTION_WEBHOOK_URL }
-      : {})
+      : {}),
+    ...(process.env.OPENCLAW_SLACK_WEBHOOK_URL
+      ? { slackWebhookUrl: process.env.OPENCLAW_SLACK_WEBHOOK_URL }
+      : {}),
+    ...(process.env.OPENCLAW_NOTION_TOKEN || process.env.OPENCLAW_NOTION_PARENT_PAGE_ID
+      ? {
+          ...(process.env.OPENCLAW_NOTION_TOKEN
+            ? { notionToken: process.env.OPENCLAW_NOTION_TOKEN }
+            : {}),
+          ...(process.env.OPENCLAW_NOTION_PARENT_PAGE_ID
+            ? { notionParentPageId: process.env.OPENCLAW_NOTION_PARENT_PAGE_ID }
+            : {})
+        }
+      : {}),
+    ...(
+      process.env.OPENCLAW_SMTP_HOST ||
+      process.env.OPENCLAW_SMTP_PORT ||
+      process.env.OPENCLAW_SMTP_FROM
+        ? {
+            smtp: {
+              ...(process.env.OPENCLAW_SMTP_HOST
+                ? { host: process.env.OPENCLAW_SMTP_HOST }
+                : {}),
+              port: Number(process.env.OPENCLAW_SMTP_PORT ?? 587),
+              ...(process.env.OPENCLAW_SMTP_USER
+                ? { user: process.env.OPENCLAW_SMTP_USER }
+                : {}),
+              ...(process.env.OPENCLAW_SMTP_PASS
+                ? { pass: process.env.OPENCLAW_SMTP_PASS }
+                : {}),
+              ...(process.env.OPENCLAW_SMTP_FROM
+                ? { from: process.env.OPENCLAW_SMTP_FROM }
+                : {}),
+              secure: process.env.OPENCLAW_SMTP_SECURE === "1"
+            }
+          }
+        : {}
+    )
   };
   const pythonToolOptions: ConstructorParameters<typeof PythonTool>[1] = {
     mode: toolMode,
@@ -1351,6 +1891,7 @@ export const buildDemoRuntime = (
 
   const routerAgent = new RouterAgent(modelRouter, openAiClient, agentMode);
   const plannerAgent = new PlannerAgent(modelRouter, openAiClient, agentMode);
+  const replannerAgent = new ReplannerAgent(modelRouter, openAiClient, agentMode);
   const verifierAgent = new VerifierAgent(modelRouter, openAiClient, agentMode);
   const agentRegistry = new AgentRegistry([
     new ResearchAgent(toolRuntime, modelRouter, openAiClient, agentMode),
@@ -1362,7 +1903,12 @@ export const buildDemoRuntime = (
   const memoryStore = resolveDbMode() === "prisma"
     ? new PersistentMemoryStore(memoryRepository)
     : new InMemoryMemoryStore();
-  const contextBuilder = new ContextBuilder(memoryStore);
+  const contextBuilder = new ContextBuilder(
+    memoryStore,
+    taskSummaryRepository,
+    artifactIndexRepository,
+    taskReferenceRepository
+  );
   const memoryWriter = new MemoryWriter(memoryStore);
   const checkpointManager = new CheckpointManager(checkpointRepository);
 
@@ -1370,12 +1916,16 @@ export const buildDemoRuntime = (
     orchestrator: new TaskOrchestrator(
       routerAgent,
       plannerAgent,
+      replannerAgent,
       verifierAgent,
       agentRegistry,
       taskRepository,
       taskEventRepository,
       taskJobRepository,
       artifactRepository,
+      taskSummaryRepository,
+      artifactIndexRepository,
+      taskReferenceRepository,
       approvalRequestRepository,
       checkpointManager,
       userProfileRepository,
@@ -1389,11 +1939,16 @@ export const buildDemoRuntime = (
     taskRepository,
     taskEventRepository,
     artifactRepository,
+    taskSummaryRepository,
+    artifactIndexRepository,
+    taskReferenceRepository,
     toolCallRepository,
     approvalRequestRepository,
     checkpointRepository,
     taskJobRepository,
     userProfileRepository,
+    benchmarkRunRepository,
+    benchmarkRunItemRepository,
     toolMode,
     agentMode,
     dbMode: resolveDbMode(),

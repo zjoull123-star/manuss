@@ -18,6 +18,18 @@ export interface ModelConfig {
   reasoningEffort: "none" | "low" | "medium" | "high";
 }
 
+export type TaskClassHint =
+  | "research_browser"
+  | "coding_python"
+  | "document_export"
+  | "action_execution";
+
+export interface ModelSelectionOptions {
+  attempt?: number;
+  finalDelivery?: boolean;
+  taskClass?: TaskClassHint;
+}
+
 export const DEFAULT_OPENAI_MODELS: Record<ModelStage, ModelConfig> = {
   router: { model: "gpt-5-nano", reasoningEffort: "none" },
   planner: { model: "gpt-5.4-2026-03-05", reasoningEffort: "high" },
@@ -238,8 +250,41 @@ const toInputMessages = (messages: ResponseMessage[]): ResponsesApiPayload["inpu
   }));
 
 export class ModelRouter {
-  get(stage: ModelStage, attempt = 0, finalDelivery = false): ModelConfig {
-    if (finalDelivery && stage === "document") {
+  get(
+    stage: ModelStage,
+    options: number | ModelSelectionOptions = 0,
+    legacyFinalDelivery = false
+  ): ModelConfig {
+    const normalized =
+      typeof options === "number"
+        ? { attempt: options, finalDelivery: legacyFinalDelivery }
+        : {
+            attempt: options.attempt ?? 0,
+            finalDelivery: options.finalDelivery ?? false,
+            taskClass: options.taskClass
+          };
+    const attempt = normalized.attempt ?? 0;
+    const finalDelivery = normalized.finalDelivery ?? false;
+    const taskClass = normalized.taskClass;
+
+    if (
+      finalDelivery &&
+      (stage === "document" ||
+        stage === "verifier_step" ||
+        stage === "verifier_final")
+    ) {
+      return DEFAULT_OPENAI_MODELS.verifier_final;
+    }
+
+    if (attempt >= 1 && ["research", "browser", "verifier_step"].includes(stage)) {
+      return DEFAULT_OPENAI_MODELS.verifier_final;
+    }
+
+    if (attempt >= 1 && stage === "document" && taskClass === "document_export") {
+      return DEFAULT_OPENAI_MODELS.verifier_final;
+    }
+
+    if (attempt >= 2 && stage === "coding" && taskClass === "document_export") {
       return DEFAULT_OPENAI_MODELS.verifier_final;
     }
 
@@ -248,6 +293,29 @@ export class ModelRouter {
     }
 
     return DEFAULT_OPENAI_MODELS[stage];
+  }
+
+  getRequestTimeoutMs(
+    stage: ModelStage,
+    taskClass?: TaskClassHint
+  ): number {
+    if (stage === "research") {
+      return 90_000;
+    }
+    if (stage === "browser") {
+      return 60_000;
+    }
+    if (stage === "coding" || stage === "document") {
+      return taskClass === "document_export" ? 90_000 : 75_000;
+    }
+    if (stage === "verifier_step" || stage === "verifier_final") {
+      return 60_000;
+    }
+    return DEFAULT_TIMEOUT_MS;
+  }
+
+  getSearchTimeoutMs(): number {
+    return 180_000;
   }
 }
 
@@ -408,7 +476,7 @@ export class OpenAIResponsesClient {
       ],
       tools,
       include: ["web_search_call.action.sources"],
-      timeoutMs: this.searchTimeoutMs
+      timeoutMs: params.stage ? this.modelRouter.getSearchTimeoutMs() : this.searchTimeoutMs
     });
 
     return {
@@ -467,7 +535,10 @@ export class OpenAIResponsesClient {
     }
 
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), options.timeoutMs ?? this.timeoutMs);
+    const timeout = setTimeout(
+      () => controller.abort(),
+      options.timeoutMs ?? this.modelRouter.getRequestTimeoutMs(options.stage) ?? this.timeoutMs
+    );
 
     try {
       const response = await fetch(`${this.baseUrl}/responses`, {

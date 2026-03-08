@@ -3,7 +3,10 @@ import {
   AgentKind,
   ApprovalStatus,
   ArtifactType,
+  BenchmarkRunStatus,
+  DeliveryKind,
   ErrorCode,
+  TaskClass,
   TaskEventKind,
   TaskJobKind,
   TaskJobStatus,
@@ -29,14 +32,31 @@ export interface Artifact {
   stepId?: string;
   type: ArtifactType;
   uri: string;
+  title?: string;
+  summary?: string;
+  keywords?: string[];
+  validated?: boolean;
+  deliveryKind?: DeliveryKind;
   metadata: JsonObject;
   createdAt: string;
+}
+
+export interface QualityProfile {
+  requiredEvidence?: string[];
+  minSourceCount?: number;
+  requireFileArtifacts?: boolean;
+  requireSchemaValid?: boolean;
+  requireOutputReadable?: boolean;
+  requireApprovalReceipt?: boolean;
 }
 
 export interface PlanStep {
   id: string;
   title: string;
   agent: AgentKind;
+  taskClass?: TaskClass;
+  qualityProfile?: QualityProfile;
+  attemptStrategy?: JsonObject;
   objective: string;
   dependsOn: string[];
   inputs: string[];
@@ -49,6 +69,14 @@ export interface Plan {
   assumptions: string[];
   steps: PlanStep[];
   taskSuccessCriteria: string[];
+}
+
+export interface FinalArtifactValidation {
+  artifactType?: ArtifactType;
+  deliveryKind?: DeliveryKind;
+  pageCount?: number;
+  validated: boolean;
+  issues: string[];
 }
 
 export interface TaskOrigin {
@@ -65,6 +93,9 @@ export interface TaskStep {
   id: string;
   title: string;
   agent: AgentKind;
+  taskClass?: TaskClass;
+  qualityProfile?: QualityProfile;
+  attemptStrategy?: JsonObject;
   objective: string;
   dependsOn: string[];
   status: StepStatus;
@@ -74,6 +105,14 @@ export interface TaskStep {
   inputArtifacts: string[];
   outputArtifacts: string[];
   structuredData: JsonObject;
+  evidencePackage?: JsonObject;
+  qualityScore?: number;
+  qualityDefects?: string[];
+  missingEvidence?: string[];
+  sourceCoverageScore?: number;
+  formatCompliance?: string;
+  attemptHistory?: JsonObject[];
+  referenceArtifactIds?: string[];
   error?: TaskError;
 }
 
@@ -81,6 +120,7 @@ export interface Task {
   id: string;
   userId: string;
   goal: string;
+  recipeId?: string;
   status: TaskStatus;
   createdAt: string;
   updatedAt: string;
@@ -89,6 +129,7 @@ export interface Task {
   steps: TaskStep[];
   origin?: TaskOrigin;
   finalArtifactUri?: string;
+  finalArtifactValidation?: FinalArtifactValidation;
   retryOfTaskId?: string;
   cancelRequestedAt?: string;
 }
@@ -137,6 +178,70 @@ export interface ToolCall {
   createdAt: string;
 }
 
+export interface TaskSummary {
+  id: string;
+  taskId: string;
+  userId: string;
+  taskClass?: TaskClass;
+  recipeId?: string;
+  summary: string;
+  keywords: string[];
+  validated: boolean;
+  createdAt: string;
+}
+
+export interface ArtifactIndexEntry {
+  id: string;
+  taskId: string;
+  stepId?: string;
+  artifactId: string;
+  artifactType: ArtifactType;
+  uri: string;
+  title?: string;
+  summary?: string;
+  keywords: string[];
+  validated: boolean;
+  taskClass?: TaskClass;
+  recipeId?: string;
+  createdAt: string;
+}
+
+export interface TaskReference {
+  id: string;
+  taskId: string;
+  sourceTaskId?: string;
+  sourceArtifactId?: string;
+  reason: string;
+  createdAt: string;
+  metadata: JsonObject;
+}
+
+export interface BenchmarkRun {
+  id: string;
+  name: string;
+  suite: string;
+  status: BenchmarkRunStatus;
+  startedAt: string;
+  completedAt?: string;
+  createdAt: string;
+  metadata: JsonObject;
+}
+
+export interface BenchmarkRunItem {
+  id: string;
+  benchmarkRunId: string;
+  caseId: string;
+  taskId?: string;
+  completed: boolean;
+  qualityScore?: number;
+  fallbackUsed: boolean;
+  artifactValidated: boolean;
+  latencyMs?: number;
+  failureCategory?: string;
+  createdAt: string;
+  metadata: JsonObject;
+}
+
 export interface ApprovalRequest {
   id: string;
   taskId: string;
@@ -173,11 +278,12 @@ export const createTaskFromPlan = (
   goal: string,
   plan: Plan,
   origin?: TaskOrigin,
-  options: { retryOfTaskId?: string; cancelRequestedAt?: string } = {}
+  options: { recipeId?: string; retryOfTaskId?: string; cancelRequestedAt?: string } = {}
 ): Task => ({
   id: createId("task"),
   userId,
   goal,
+  ...(options.recipeId ? { recipeId: options.recipeId } : {}),
   status: TaskStatus.Planned,
   createdAt: nowIso(),
   updatedAt: nowIso(),
@@ -187,6 +293,9 @@ export const createTaskFromPlan = (
     id: step.id,
     title: step.title,
     agent: step.agent,
+    ...(step.taskClass ? { taskClass: step.taskClass } : {}),
+    ...(step.qualityProfile ? { qualityProfile: step.qualityProfile } : {}),
+    ...(step.attemptStrategy ? { attemptStrategy: step.attemptStrategy } : {}),
     objective: step.objective,
     dependsOn: step.dependsOn,
     status: StepStatus.Pending,
@@ -205,11 +314,12 @@ export const createDraftTask = (
   userId: string,
   goal: string,
   origin?: TaskOrigin,
-  options: { retryOfTaskId?: string; cancelRequestedAt?: string } = {}
+  options: { recipeId?: string; retryOfTaskId?: string; cancelRequestedAt?: string } = {}
 ): Task => ({
   id: createId("task"),
   userId,
   goal,
+  ...(options.recipeId ? { recipeId: options.recipeId } : {}),
   status: TaskStatus.Created,
   createdAt: nowIso(),
   updatedAt: nowIso(),

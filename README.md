@@ -44,6 +44,30 @@ The console lets you:
 - inspect steps, jobs, approvals, artifacts, and tool calls
 - preview generated markdown and screenshots
 
+## Benchmark suites and baselines
+
+The repository now includes local benchmark cases under `packages/evals` and versioned recipes under
+`packages/recipes`.
+
+Run benchmark suites with:
+
+```bash
+npm run evals:smoke
+npm run evals
+```
+
+Write local baseline snapshots with:
+
+```bash
+npm run evals:baseline:smoke
+npm run evals:baseline:full
+```
+
+Each run writes a detailed report to `.data/evals/<runId>/report.json`. Baseline snapshots are written
+to `.data/evals/baselines/` and are kept local rather than committed.
+
+See [docs/evals-baseline.md](docs/evals-baseline.md) for details.
+
 ## Launchd service mode
 
 On macOS you can keep the Manus API and worker running as user launch agents:

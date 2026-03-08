@@ -19,17 +19,27 @@
     "test": "OPENCLAW_DB_MODE=inmemory OPENCLAW_AGENT_MODE=mock OPENCLAW_TOOL_MODE=mock OPENCLAW_BROWSER_MODE=mock npm run build && OPENCLAW_DB_MODE=inmemory OPENCLAW_AGENT_MODE=mock OPENCLAW_TOOL_MODE=mock OPENCLAW_BROWSER_MODE=mock node --test dist/packages/agents/test/*.test.js dist/packages/tools/test/*.test.js dist/packages/policy/test/*.test.js dist/packages/orchestrator/test/*.test.js dist/apps/gateway/test/*.test.js",
     "dev:worker": "tsx apps/worker/src/index.ts",
     "dev:gateway": "tsx apps/gateway/src/index.ts",
-    "dev:api": "tsx apps/api/src/index.ts"
+    "dev:api": "tsx apps/api/src/index.ts",
+    "evals": "tsx scripts/evals.ts --suite full",
+    "evals:smoke": "tsx scripts/evals.ts --suite smoke",
+    "evals:case": "tsx scripts/evals.ts --case",
+    "evals:baseline:smoke": "tsx scripts/evals.ts --suite smoke --write-baseline",
+    "evals:baseline:full": "tsx scripts/evals.ts --suite full --write-baseline"
   },
   "engines": {
     "node": ">=22.0.0"
   },
   "dependencies": {
     "@prisma/client": "^6.6.0",
-    "playwright": "^1.52.0"
+    "docx": "^9.6.0",
+    "exceljs": "^4.4.0",
+    "nodemailer": "^8.0.1",
+    "playwright": "^1.52.0",
+    "pptxgenjs": "^4.0.1"
   },
   "devDependencies": {
     "@types/node": "^22.13.10",
+    "@types/nodemailer": "^7.0.11",
     "prisma": "^6.6.0",
     "tsx": "^4.19.3",
     "typescript": "^5.8.2"

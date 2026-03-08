@@ -32,7 +32,7 @@ test("demo runtime completes a multi-step task and produces an artifact", async 
   await fs.access(task.finalArtifactUri);
 
   const reportContents = await fs.readFile(task.finalArtifactUri, "utf8");
-  assert.match(reportContents, /Key Findings/);
+  assert.match(reportContents, /摘要|Key Findings/);
 });
 
 test("task origin is preserved when preparing a task", async () => {

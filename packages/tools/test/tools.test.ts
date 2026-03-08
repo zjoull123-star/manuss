@@ -9,7 +9,33 @@ import { createInMemoryRepositories } from "../../db/src";
 import { AgentKind, ToolName } from "../../core/src";
 import { ConsoleLogger } from "../../observability/src";
 import { ToolPolicyService } from "../../policy/src";
-import { BrowserTool, DocumentTool, PythonTool, ToolRuntime, type Tool } from "../src";
+import { BrowserTool, DocumentTool, PythonTool, SearchTool, ToolRuntime, type Tool } from "../src";
+
+test("search tool mock mode returns enough sources for feasibility-style baselines", async () => {
+  const tool = new SearchTool(
+    {
+      isConfigured: () => false
+    } as never,
+    {
+      mode: "mock"
+    }
+  );
+
+  const response = await tool.execute({
+    taskId: "task_search_mock",
+    stepId: "s1",
+    toolName: ToolName.Search,
+    action: "search_web",
+    callerAgent: AgentKind.Research,
+    input: {
+      query: "UAE perfume manufacturing feasibility regulatory setup"
+    }
+  });
+
+  assert.equal(response.status, "success");
+  const results = Array.isArray(response.output?.results) ? response.output.results : [];
+  assert.equal(results.length >= 4, true);
+});
 
 test("python tool executes a local script and captures generated files", async () => {
   const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-manus-python-"));

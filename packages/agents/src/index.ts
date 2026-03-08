@@ -1,4 +1,5 @@
 import { promises as fs } from "node:fs";
+import path from "node:path";
 import {
   AgentKind,
   AgentRequest,
@@ -7,11 +8,16 @@ import {
   ErrorCode,
   Plan,
   PlanningAgent,
+  QualityProfile,
+  ReplanningAgent,
   RouteDecision,
   RoutingAgent,
   StepAgent,
+  StepStatus,
   Task,
+  TaskClass,
   TaskStep,
+  ToolResponse,
   ToolName,
   UserProfile,
   VerificationDecision,
@@ -19,12 +25,14 @@ import {
 } from "../../core/src";
 import { JsonObject } from "../../shared/src";
 import { ModelRouter, OpenAIResponsesClient } from "../../llm/src";
+import { buildRecipePlanningContext, getRecipeById, matchRecipeForGoal, RecipeDefinition } from "../../recipes/src";
 import {
   BROWSER_PROMPT_TEMPLATE,
   CODING_PROMPT_TEMPLATE,
   DOCUMENT_PROMPT_TEMPLATE,
   PLANNER_PROMPT_TEMPLATE,
   RESEARCH_PROMPT_TEMPLATE,
+  REPLANNER_PROMPT_TEMPLATE,
   ROUTER_PROMPT_TEMPLATE,
   VERIFIER_PROMPT_TEMPLATE
 } from "../../prompts/src";
@@ -38,6 +46,23 @@ const hasKeyword = (input: string, keywords: string[]): boolean =>
 const TASK_PREFIX_PATTERN = /^\s*task:\s*/i;
 
 const AGENT_KIND_VALUES = Object.values(AgentKind);
+const TASK_CLASS_VALUES = Object.values(TaskClass);
+
+const QUALITY_PROFILE_SCHEMA: JsonObject = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    requiredEvidence: {
+      type: "array",
+      items: { type: "string" }
+    },
+    minSourceCount: { type: "number" },
+    requireFileArtifacts: { type: "boolean" },
+    requireSchemaValid: { type: "boolean" },
+    requireOutputReadable: { type: "boolean" },
+    requireApprovalReceipt: { type: "boolean" }
+  }
+};
 
 const ROUTE_DECISION_SCHEMA: JsonObject = {
   type: "object",
@@ -83,6 +108,15 @@ const PLAN_SCHEMA: JsonObject = {
           agent: {
             type: "string",
             enum: AGENT_KIND_VALUES
+          },
+          taskClass: {
+            type: "string",
+            enum: TASK_CLASS_VALUES
+          },
+          qualityProfile: QUALITY_PROFILE_SCHEMA,
+          attemptStrategy: {
+            type: "object",
+            additionalProperties: true
           },
           objective: { type: "string" },
           dependsOn: {
@@ -136,9 +170,29 @@ const RESEARCH_SYNTHESIS_SCHEMA: JsonObject = {
     coverageGaps: {
       type: "array",
       items: { type: "string" }
+    },
+    timelineEvents: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          date: { type: "string" },
+          event: { type: "string" },
+          sourceUrl: { type: "string" }
+        },
+        required: ["date", "event", "sourceUrl"]
+      }
     }
   },
-  required: ["summary", "topResultUrl", "findings", "marketSignals", "coverageGaps"]
+  required: [
+    "summary",
+    "topResultUrl",
+    "findings",
+    "marketSignals",
+    "coverageGaps",
+    "timelineEvents"
+  ]
 };
 
 type ResearchSynthesis = {
@@ -147,6 +201,7 @@ type ResearchSynthesis = {
   findings: string[];
   marketSignals: string[];
   coverageGaps: string[];
+  timelineEvents: Array<{ date: string; event: string; sourceUrl: string }>;
 };
 
 type BrowserSynthesis = {
@@ -205,12 +260,24 @@ const DOCUMENT_DRAFT_SCHEMA: JsonObject = {
     summary: { type: "string" },
     title: { type: "string" },
     markdownBody: { type: "string" },
+    usedSources: {
+      type: "array",
+      items: { type: "string" }
+    },
     keySections: {
       type: "array",
       items: { type: "string" }
     }
   },
-  required: ["summary", "title", "markdownBody", "keySections"]
+  required: ["summary", "title", "markdownBody", "keySections", "usedSources"]
+};
+
+type DocumentDraft = {
+  summary: string;
+  title: string;
+  markdownBody: string;
+  keySections: string[];
+  usedSources: string[];
 };
 
 const CODING_DRAFT_SCHEMA: JsonObject = {
@@ -242,9 +309,31 @@ const VERIFICATION_SCHEMA: JsonObject = {
       items: { type: "string" }
     },
     suggestedFix: { type: "string" },
-    confidence: { type: "number", minimum: 0, maximum: 1 }
+    confidence: { type: "number", minimum: 0, maximum: 1 },
+    qualityScore: { type: "number", minimum: 0, maximum: 100 },
+    qualityDefects: {
+      type: "array",
+      items: { type: "string" }
+    },
+    missingEvidence: {
+      type: "array",
+      items: { type: "string" }
+    },
+    sourceCoverageScore: { type: "number", minimum: 0, maximum: 100 },
+    formatCompliance: { type: "string" }
   },
-  required: ["verdict", "reason", "missingCriteria", "suggestedFix", "confidence"]
+  required: [
+    "verdict",
+    "reason",
+    "missingCriteria",
+    "suggestedFix",
+    "confidence",
+    "qualityScore",
+    "qualityDefects",
+    "missingEvidence",
+    "sourceCoverageScore",
+    "formatCompliance"
+  ]
 };
 
 const userProfileSummary = (userProfile?: UserProfile): JsonObject =>
@@ -275,6 +364,8 @@ const getErrorMessage = (error: unknown): string =>
 
 const buildTextPreview = (value: string, maxChars: number): string =>
   value.length <= maxChars ? value : `${value.slice(0, maxChars)}\n...[truncated]`;
+
+const uniqueStrings = (values: string[]): string[] => [...new Set(values.filter(Boolean))];
 
 const extractMarkdownHeadings = (markdownBody: string): string[] => {
   const headings = markdownBody
@@ -407,7 +498,8 @@ const RESEARCH_SYNTHESIS_FIELDS = [
   "topResultUrl",
   "findings",
   "marketSignals",
-  "coverageGaps"
+  "coverageGaps",
+  "timelineEvents"
 ] as const;
 
 const BROWSER_SYNTHESIS_FIELDS = [
@@ -422,16 +514,72 @@ const BROWSER_SYNTHESIS_FIELDS = [
 const isStringArray = (value: unknown): value is string[] =>
   Array.isArray(value) && value.every((item) => typeof item === "string");
 
+const splitLooseListText = (value: string): string[] =>
+  value
+    .split(/\r?\n|[•·]|;\s*|；\s*|\u2022/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+
+const collectLooseStringFragments = (value: unknown, depth = 0): string[] => {
+  if (depth > 4 || value == null) {
+    return [];
+  }
+
+  if (typeof value === "string") {
+    return splitLooseListText(value);
+  }
+
+  if (typeof value === "number" || typeof value === "boolean") {
+    return [String(value)];
+  }
+
+  if (Array.isArray(value)) {
+    return uniqueStrings(
+      value.flatMap((item) => collectLooseStringFragments(item, depth + 1))
+    );
+  }
+
+  if (typeof value === "object") {
+    const candidate = value as Record<string, unknown>;
+    const preferredKeys = [
+      "items",
+      "values",
+      "value",
+      "text",
+      "content",
+      "summary",
+      "description",
+      "snippet",
+      "title",
+      "label",
+      "name",
+      "signals",
+      "gaps",
+      "findings"
+    ];
+    const prioritized = preferredKeys.flatMap((key) =>
+      Object.prototype.hasOwnProperty.call(candidate, key)
+        ? collectLooseStringFragments(candidate[key], depth + 1)
+        : []
+    );
+    const fallback = Object.entries(candidate)
+      .filter(([key]) => !preferredKeys.includes(key))
+      .flatMap(([, item]) => collectLooseStringFragments(item, depth + 1));
+
+    return uniqueStrings([...prioritized, ...fallback]);
+  }
+
+  return [];
+};
+
 const normalizeStringList = (value: unknown, fieldName: string): string[] => {
   if (isStringArray(value)) {
     return value;
   }
 
-  if (typeof value === "string") {
-    return value
-      .split(/\r?\n|•|·|;\s+/)
-      .map((item) => item.trim())
-      .filter(Boolean);
+  const normalized = uniqueStrings(collectLooseStringFragments(value));
+  if (normalized.length > 0 || value == null) {
+    return normalized;
   }
 
   throw new Error(`research synthesis schema mismatch: ${fieldName} must be string[]`);
@@ -463,13 +611,28 @@ const validateResearchSynthesis = (value: unknown): ResearchSynthesis => {
   const findings = normalizeStringList(candidate.findings, "findings");
   const marketSignals = normalizeStringList(candidate.marketSignals, "marketSignals");
   const coverageGaps = normalizeStringList(candidate.coverageGaps, "coverageGaps");
+  const timelineEvents = Array.isArray(candidate.timelineEvents)
+    ? candidate.timelineEvents
+        .flatMap((event) => {
+          const eventCandidate = asJsonObject(event);
+          const date = asOptionalString(eventCandidate["date"]);
+          const summary = asOptionalString(eventCandidate["event"]);
+          const sourceUrl = asOptionalString(eventCandidate["sourceUrl"]);
+          if (!date || !summary || !sourceUrl) {
+            return [];
+          }
+          return [{ date, event: summary, sourceUrl }];
+        })
+        .slice(0, 12)
+    : [];
 
   return {
     summary: candidate.summary,
     topResultUrl: candidate.topResultUrl,
     findings,
     marketSignals,
-    coverageGaps
+    coverageGaps,
+    timelineEvents
   };
 };
 
@@ -544,6 +707,140 @@ const validateCodingDraft = (value: unknown): CodingDraft => {
     filename: candidate.filename,
     pythonCode: candidate.pythonCode,
     expectedArtifacts: normalizeStringList(candidate.expectedArtifacts, "expectedArtifacts")
+  };
+};
+
+const validateDocumentDraft = (value: unknown): DocumentDraft => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("document draft schema mismatch: expected object");
+  }
+
+  const candidate = value as Record<string, unknown>;
+  if (typeof candidate.summary !== "string") {
+    throw new Error("document draft schema mismatch: summary must be string");
+  }
+  if (typeof candidate.title !== "string") {
+    throw new Error("document draft schema mismatch: title must be string");
+  }
+  if (typeof candidate.markdownBody !== "string") {
+    throw new Error("document draft schema mismatch: markdownBody must be string");
+  }
+
+  return {
+    summary: candidate.summary,
+    title: candidate.title,
+    markdownBody: candidate.markdownBody,
+    keySections: normalizeStringList(candidate.keySections, "keySections"),
+    usedSources: normalizeStringList(candidate.usedSources, "usedSources")
+  };
+};
+
+const QUALITY_THRESHOLDS: Record<TaskClass, number> = {
+  [TaskClass.ResearchBrowser]: 75,
+  [TaskClass.CodingPython]: 80,
+  [TaskClass.DocumentExport]: 80,
+  [TaskClass.ActionExecution]: 80
+};
+
+const buildQualityProfile = (
+  taskClass: TaskClass,
+  goal: string,
+  step?: Partial<Pick<TaskStep, "title" | "objective" | "successCriteria">>
+): QualityProfile => {
+  if (taskClass === TaskClass.ResearchBrowser) {
+    return {
+      requiredEvidence: hasKeyword(goal, ["时间线", "timeline", "latest", "最新"])
+        ? ["sources", "findings", "timelineEvents"]
+        : ["sources", "findings"],
+      minSourceCount: hasKeyword(goal, ["latest", "最新", "局势", "战情", "research", "调研"]) ? 3 : 2,
+      requireSchemaValid: true,
+      requireOutputReadable: true
+    };
+  }
+  if (taskClass === TaskClass.CodingPython) {
+    return {
+      requiredEvidence: ["generatedFiles"],
+      requireFileArtifacts: true,
+      requireSchemaValid: true,
+      requireOutputReadable: true
+    };
+  }
+  if (taskClass === TaskClass.ActionExecution) {
+    return {
+      requiredEvidence: ["deliveryReceipt"],
+      requireApprovalReceipt: true,
+      requireOutputReadable: true
+    };
+  }
+
+  const requiresPdf = hasKeyword(
+    [goal, step?.title ?? "", step?.objective ?? "", ...(step?.successCriteria ?? [])].join("\n"),
+    PDF_KEYWORDS
+  );
+  return {
+    requiredEvidence: requiresPdf
+      ? ["reportPreview", "keySections", "artifactValidation"]
+      : ["reportPreview", "keySections"],
+    requireFileArtifacts: true,
+    requireOutputReadable: true,
+    requireSchemaValid: true
+  };
+};
+
+const classifyTaskClass = (
+  goal: string,
+  step: Pick<Plan["steps"][number], "agent" | "title" | "objective" | "successCriteria">
+): TaskClass => {
+  if (step.agent === AgentKind.Action) {
+    return TaskClass.ActionExecution;
+  }
+  if (step.agent === AgentKind.Coding) {
+    return TaskClass.CodingPython;
+  }
+  if (step.agent === AgentKind.Document) {
+    return TaskClass.DocumentExport;
+  }
+  return TaskClass.ResearchBrowser;
+};
+
+const buildAttemptStrategy = (
+  taskClass: TaskClass,
+  agent: AgentKind,
+  attempt = 0
+): JsonObject => {
+  if (attempt <= 0) {
+    return {
+      attempt,
+      strategy: "default_execution",
+      escalatedModel: false,
+      maxRetries:
+        agent === AgentKind.Research || agent === AgentKind.Browser
+          ? 3
+          : agent === AgentKind.Action
+            ? 1
+            : 2
+    };
+  }
+
+  const strategy =
+    attempt === 1
+      ? "repair_context_and_retry"
+      : attempt === 2
+        ? "escalate_model_or_tool"
+        : "fallback_or_replan";
+
+  return {
+    attempt,
+    strategy,
+    escalatedModel:
+      attempt >= 1 &&
+      [TaskClass.ResearchBrowser, TaskClass.DocumentExport].includes(taskClass),
+    maxRetries:
+      agent === AgentKind.Research || agent === AgentKind.Browser
+        ? 3
+        : agent === AgentKind.Action
+          ? 1
+          : 2
   };
 };
 
@@ -738,7 +1035,7 @@ const recoverResearchSynthesis = async (
           RESEARCH_PROMPT_TEMPLATE,
           "Your previous response was invalid JSON or schema-invalid.",
           "Return strict JSON only with exactly these keys:",
-          'summary (string), topResultUrl (string), findings (string[]), marketSignals (string[]), coverageGaps (string[]).',
+          'summary (string), topResultUrl (string), findings (string[]), marketSignals (string[]), coverageGaps (string[]), timelineEvents ({date,event,sourceUrl}[]).',
           "Do not use markdown fences or explanatory text.",
           "Escape newlines inside JSON strings."
         ].join("\n")
@@ -755,7 +1052,7 @@ const recoverResearchSynthesis = async (
         )
       }
     ],
-    maxOutputTokens: 1_000
+    maxOutputTokens: 1_200
   });
 
   return validateResearchSynthesis(parseJsonWithConservativeRepair(response.outputText));
@@ -835,6 +1132,43 @@ const recoverCodingDraft = async (
   return validateCodingDraft(parseJsonWithConservativeRepair(response.outputText));
 };
 
+const recoverDocumentDraft = async (
+  llmClient: OpenAIResponsesClient,
+  payload: JsonObject,
+  originalError: unknown
+): Promise<DocumentDraft> => {
+  const response = await llmClient.generateText({
+    stage: "document",
+    messages: [
+      {
+        role: "system",
+        content: [
+          DOCUMENT_PROMPT_TEMPLATE,
+          "Your previous response was invalid JSON or schema-invalid.",
+          "Return strict JSON only with exactly these keys:",
+          'summary (string), title (string), markdownBody (string), keySections (string[]), usedSources (string[]).',
+          "Do not use markdown fences or explanatory text.",
+          "Escape newlines inside JSON strings."
+        ].join("\n")
+      },
+      {
+        role: "user",
+        content: JSON.stringify(
+          {
+            ...payload,
+            originalErrorMessage: getErrorMessage(originalError)
+          },
+          null,
+          2
+        )
+      }
+    ],
+    maxOutputTokens: 2_200
+  });
+
+  return validateDocumentDraft(parseJsonWithConservativeRepair(response.outputText));
+};
+
 const asOptionalString = (value: unknown): string | undefined =>
   typeof value === "string" && value.length > 0 ? value : undefined;
 
@@ -845,8 +1179,6 @@ const asJsonObject = (value: unknown): JsonObject =>
   value && typeof value === "object" && !Array.isArray(value)
     ? (value as JsonObject)
     : {};
-
-const uniqueStrings = (values: string[]): string[] => [...new Set(values.filter(Boolean))];
 
 const asUrlArray = (value: unknown): string[] =>
   uniqueStrings(
@@ -868,6 +1200,105 @@ const collectSearchResultUrls = (results: unknown, maxUrls = 6): string[] => {
   });
 
   return asUrlArray(urls).slice(0, maxUrls);
+};
+
+const classifySourceTier = (url: string): "tier1" | "tier2" | "tier3" => {
+  const normalized = url.toLowerCase();
+  if (
+    normalized.includes(".gov") ||
+    normalized.includes(".gouv") ||
+    normalized.includes(".edu") ||
+    normalized.includes(".org") ||
+    normalized.includes("reuters.com") ||
+    normalized.includes("apnews.com") ||
+    normalized.includes("bbc.") ||
+    normalized.includes("u.ae") ||
+    normalized.includes("dm.gov.ae") ||
+    normalized.includes("mohap.gov.ae")
+  ) {
+    return "tier1";
+  }
+  if (
+    normalized.includes("gulfbusiness.com") ||
+    normalized.includes("gulfnews.com") ||
+    normalized.includes("khaleejtimes.com") ||
+    normalized.includes("forbes") ||
+    normalized.includes("bloomberg") ||
+    normalized.includes("intertek") ||
+    normalized.includes("sgs")
+  ) {
+    return "tier2";
+  }
+  return "tier3";
+};
+
+const buildSourceEvidence = (
+  results: unknown,
+  maxItems = 12
+): Array<{ title: string; url: string; snippet: string; tier: string }> => {
+  if (!Array.isArray(results)) {
+    return [];
+  }
+
+  const seen = new Set<string>();
+  const sources: Array<{ title: string; url: string; snippet: string; tier: string }> = [];
+  for (const result of results) {
+    const candidate = asJsonObject(result);
+    const url = asOptionalString(candidate["url"]);
+    if (!url || seen.has(url)) {
+      continue;
+    }
+    seen.add(url);
+    sources.push({
+      title: asOptionalString(candidate["title"]) ?? url,
+      url,
+      snippet: asOptionalString(candidate["snippet"]) ?? "",
+      tier: classifySourceTier(url)
+    });
+    if (sources.length >= maxItems) {
+      break;
+    }
+  }
+
+  return sources;
+};
+
+const DATE_PATTERN =
+  /\b(?:20\d{2}[-/]\d{1,2}[-/]\d{1,2}|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2},?\s+20\d{2}|\d{1,2}\s+[A-Z][a-z]{2,8}\s+20\d{2})\b/gi;
+
+const buildTimelineEventsFromSources = (
+  results: unknown,
+  maxItems = 8
+): Array<{ date: string; event: string; sourceUrl: string }> => {
+  if (!Array.isArray(results)) {
+    return [];
+  }
+
+  const events: Array<{ date: string; event: string; sourceUrl: string }> = [];
+  for (const result of results) {
+    const candidate = asJsonObject(result);
+    const url = asOptionalString(candidate["url"]);
+    const title = asOptionalString(candidate["title"]) ?? "";
+    const snippet = asOptionalString(candidate["snippet"]) ?? "";
+    if (!url) {
+      continue;
+    }
+    const haystack = `${title}. ${snippet}`;
+    const matches = haystack.match(DATE_PATTERN);
+    if (!matches || matches.length === 0) {
+      continue;
+    }
+    events.push({
+      date: matches[0],
+      event: buildTextPreview(haystack, 200),
+      sourceUrl: url
+    });
+    if (events.length >= maxItems) {
+      break;
+    }
+  }
+
+  return events;
 };
 
 const BLOCKED_PAGE_PATTERNS = [
@@ -895,6 +1326,33 @@ const detectBlockedPageReason = (
   }
 
   return `Blocked or challenge page detected: ${matched}`;
+};
+
+const NON_SUBSTANTIVE_PAGE_PATTERNS = [
+  "404 - file or directory not found",
+  "404 not found",
+  "page not found",
+  "file or directory not found",
+  "resource you are looking for might have been removed",
+  "temporarily unavailable",
+  "the page you requested could not be found",
+  "page you requested was not found",
+  "this page isn’t available",
+  "this page isn't available"
+];
+
+const detectNonSubstantivePageReason = (
+  pageTitle: string,
+  extractedText: string,
+  currentUrl: string
+): string | undefined => {
+  const haystack = `${pageTitle}\n${extractedText}\n${currentUrl}`.toLowerCase();
+  const matched = NON_SUBSTANTIVE_PAGE_PATTERNS.find((pattern) => haystack.includes(pattern));
+  if (!matched) {
+    return undefined;
+  }
+
+  return `Low-substance page detected: ${matched}`;
 };
 
 const getBrowserCandidateUrls = (context: JsonObject): string[] => {
@@ -937,6 +1395,9 @@ const CODING_KEYWORDS = [
 const REPORT_KEYWORDS = ["报告", "report", "总结", "summary", "markdown", "文档", "brief"];
 
 const PDF_KEYWORDS = ["pdf", "导出pdf", "输出pdf", "pdf文件", "导出为pdf", "排版并导出pdf"];
+const EMAIL_KEYWORDS = ["email", "邮件", "mail", "发邮件"];
+const SLACK_KEYWORDS = ["slack"];
+const NOTION_KEYWORDS = ["notion"];
 
 const buildUploadedFileCodingDraft = (input: AgentRequest): CodingDraft | undefined => {
   const currentStep = asJsonObject(input.context["currentStep"]);
@@ -1129,19 +1590,23 @@ const isPdfExportRequest = (input: AgentRequest): boolean => {
     .join("\n");
 
   if (stepSignals.length > 0) {
-    return hasKeyword(stepSignals, PDF_KEYWORDS);
+    return isExplicitPdfExportPlanStep({
+      title,
+      objective,
+      expectedOutput,
+      successCriteria: Array.isArray(input.successCriteria) ? input.successCriteria.map(String) : []
+    });
   }
 
   return hasKeyword([input.goal, successCriteria].join("\n"), PDF_KEYWORDS);
 };
 
 const stepRequiresPdfArtifact = (step: TaskStep): boolean =>
-  hasKeyword(
-    [step.title, step.objective, ...(Array.isArray(step.successCriteria) ? step.successCriteria : [])].join(
-      "\n"
-    ),
-    PDF_KEYWORDS
-  );
+  isExplicitPdfExportPlanStep({
+    title: step.title,
+    objective: step.objective,
+    successCriteria: Array.isArray(step.successCriteria) ? step.successCriteria : []
+  });
 
 const hasPdfVerificationEvidence = (response: AgentResponse): boolean => {
   const structuredData = asJsonObject(response.structuredData ?? {});
@@ -1202,6 +1667,13 @@ const normalizeVerificationDecision = (
   response: AgentResponse,
   decision: VerificationDecision
 ): VerificationDecision => {
+  const qualityScore = typeof decision.qualityScore === "number" ? decision.qualityScore : undefined;
+  const qualityDefects = Array.isArray(decision.qualityDefects) ? decision.qualityDefects : [];
+  const missingEvidence = Array.isArray(decision.missingEvidence) ? decision.missingEvidence : [];
+  const sourceCoverageScore =
+    typeof decision.sourceCoverageScore === "number" ? decision.sourceCoverageScore : 0;
+  const formatCompliance = decision.formatCompliance ?? "unknown";
+
   if (
     stepRequiresPdfArtifact(step) &&
     decision.verdict !== "pass" &&
@@ -1212,11 +1684,249 @@ const normalizeVerificationDecision = (
       reason: "PDF artifact and preview evidence are present",
       missingCriteria: [],
       suggestedFix: "",
-      confidence: Math.max(decision.confidence, 0.9)
+      confidence: Math.max(decision.confidence, 0.9),
+      qualityScore: Math.max(qualityScore ?? 85, 85),
+      qualityDefects: qualityDefects.filter((item) => !/pdf|artifact/i.test(item)),
+      missingEvidence: missingEvidence.filter((item) => !/pdf|artifact/i.test(item)),
+      sourceCoverageScore,
+      formatCompliance: "validated_pdf_artifact"
     };
   }
 
-  return decision;
+  return {
+    ...decision,
+    ...(typeof qualityScore === "number" ? { qualityScore } : {}),
+    ...(qualityDefects.length > 0 ? { qualityDefects } : {}),
+    ...(missingEvidence.length > 0 ? { missingEvidence } : {}),
+    ...(typeof sourceCoverageScore === "number" ? { sourceCoverageScore } : {}),
+    ...(formatCompliance ? { formatCompliance } : {})
+  };
+};
+
+const getStepTaskClass = (task: Task, step: TaskStep): TaskClass =>
+  step.taskClass ?? classifyTaskClass(task.goal, step);
+
+const calculateQualityAssessment = (
+  task: Task,
+  step: TaskStep,
+  response: AgentResponse
+): VerificationDecision => {
+  const taskClass = getStepTaskClass(task, step);
+  const profile = step.qualityProfile ?? buildQualityProfile(taskClass, task.goal, step);
+  const structured = asJsonObject(response.structuredData);
+  const artifacts = Array.isArray(response.artifacts) ? response.artifacts.map(String) : [];
+  const qualityDefects: string[] = [];
+  const missingEvidence: string[] = [];
+  const missingCriteria: string[] = [];
+  let sourceCoverageScore = 0;
+  let formatCompliance = "valid";
+
+  if (response.status === "need_approval") {
+    return {
+      verdict: "ask_user",
+      reason: response.summary || "Step requires approval before execution",
+      missingCriteria: step.successCriteria,
+      suggestedFix: "Approve the pending action to continue execution",
+      confidence: 0.92,
+      qualityScore: 80,
+      qualityDefects: [],
+      missingEvidence: ["approval"],
+      sourceCoverageScore: 100,
+      formatCompliance: "approval_pending"
+    };
+  }
+
+  if (response.status !== "success") {
+    return {
+      verdict: response.error?.retryable ? "retry_step" : "replan_task",
+      reason: response.error?.message || response.summary || "Step failed",
+      missingCriteria: step.successCriteria,
+      suggestedFix: "Inspect tool output or retry with stronger strategy",
+      confidence: 0.82,
+      qualityScore: 15,
+      qualityDefects: [response.error?.message || "step execution failed"],
+      missingEvidence: profile.requiredEvidence ?? [],
+      sourceCoverageScore: 0,
+      formatCompliance: "failed"
+    };
+  }
+
+  if (taskClass === TaskClass.ResearchBrowser) {
+    const sources = Array.isArray(structured["sources"]) ? structured["sources"] : [];
+    const findings = asFindingsArray(structured["findings"]);
+    const extractedFacts = asStringArray(structured["extractedFacts"]);
+    const timelineEvents = Array.isArray(structured["timelineEvents"]) ? structured["timelineEvents"] : [];
+    const requiresTimelineEvidence = (profile.requiredEvidence ?? []).includes("timelineEvents");
+    const inheritedTimelineEvidence =
+      step.agent === AgentKind.Browser &&
+      task.steps.some((candidate) => {
+        if (candidate.id === step.id || candidate.status !== StepStatus.Completed) {
+          return false;
+        }
+        const candidateStructured = asJsonObject(candidate.structuredData);
+        return (
+          Array.isArray(candidateStructured["timelineEvents"]) &&
+          candidateStructured["timelineEvents"].length > 0
+        );
+      });
+    const sourceCount =
+      typeof structured["sourceCount"] === "number" ? Number(structured["sourceCount"]) : sources.length;
+    const minSourceCount = profile.minSourceCount ?? 2;
+    sourceCoverageScore = Math.min(100, sourceCount * 20);
+    if (sourceCount < minSourceCount) {
+      qualityDefects.push(`source coverage below threshold (${sourceCount}/${minSourceCount})`);
+      missingEvidence.push("sources");
+      missingCriteria.push(`至少 ${minSourceCount} 个来源`);
+    }
+    if (findings.length === 0 && extractedFacts.length === 0) {
+      qualityDefects.push("no findings or extracted facts");
+      missingEvidence.push("findings");
+    }
+    if (
+      requiresTimelineEvidence &&
+      timelineEvents.length === 0 &&
+      !inheritedTimelineEvidence
+    ) {
+      qualityDefects.push("timeline evidence missing");
+      missingEvidence.push("timelineEvents");
+    }
+  } else if (taskClass === TaskClass.CodingPython) {
+    const generatedFiles = asStringArray(structured["generatedFiles"]);
+    const outputSchemas = asStringArray(structured["outputSchemas"]);
+    const artifactValidation = asJsonObject(structured["artifactValidation"]);
+    const stderr = asOptionalString(structured["stderr"]) ?? "";
+    if ((profile.requireFileArtifacts ?? true) && generatedFiles.length === 0 && artifacts.length === 0) {
+      qualityDefects.push("no generated files or artifacts");
+      missingEvidence.push("generatedFiles");
+    }
+    if (stderr.toLowerCase().includes("syntaxerror")) {
+      qualityDefects.push("python syntax error");
+      formatCompliance = "invalid_python";
+    }
+    if ((profile.requireSchemaValid ?? true) && generatedFiles.length > 0 && outputSchemas.length === 0) {
+      qualityDefects.push("generated files have no output schema hints");
+    }
+    if (artifactValidation["validated"] === false) {
+      qualityDefects.push("artifact validation failed");
+      formatCompliance = "artifact_validation_failed";
+    }
+  } else if (taskClass === TaskClass.DocumentExport) {
+    const keySections = asStringArray(structured["keySections"]);
+    const reportPreview = asOptionalString(structured["reportPreview"]) ?? "";
+    const artifactValidation = asJsonObject(structured["artifactValidation"]);
+    const usedSources = asStringArray(structured["usedSources"]);
+    if (artifacts.length === 0) {
+      qualityDefects.push("document step returned no artifact");
+      missingEvidence.push("artifact");
+    }
+    if (reportPreview.trim().length === 0) {
+      qualityDefects.push("missing report preview");
+      missingEvidence.push("reportPreview");
+    }
+    if (keySections.length === 0) {
+      qualityDefects.push("missing key sections");
+      missingEvidence.push("keySections");
+    }
+    if (stepRequiresPdfArtifact(step) && ![...artifacts, ...asStringArray(structured["generatedFiles"])].some((file) => file.toLowerCase().endsWith(".pdf"))) {
+      qualityDefects.push("missing pdf artifact");
+      missingEvidence.push("pdf artifact");
+      formatCompliance = "missing_pdf";
+    }
+    if (usedSources.length === 0 && hasKeyword(task.goal, ["source", "sources", "来源", "链接"])) {
+      qualityDefects.push("missing source references");
+      missingEvidence.push("usedSources");
+    }
+    if (artifactValidation["validated"] === false) {
+      qualityDefects.push("artifact validation failed");
+      formatCompliance = "artifact_validation_failed";
+    }
+  } else if (taskClass === TaskClass.ActionExecution) {
+    const receipt = asJsonObject(structured["deliveryReceipt"]);
+    const approvalStatus = asOptionalString(structured["approvalStatus"]);
+    if ((profile.requireApprovalReceipt ?? true) && Object.keys(receipt).length === 0) {
+      qualityDefects.push("missing delivery receipt");
+      missingEvidence.push("deliveryReceipt");
+    }
+    if (!approvalStatus || (approvalStatus !== ApprovalStatus.Executed && approvalStatus !== ApprovalStatus.Approved)) {
+      qualityDefects.push("approval receipt missing or not executed");
+    }
+  }
+
+  const qualityScore = Math.max(
+    0,
+    Math.min(100, 100 - qualityDefects.length * 15 - missingEvidence.length * 10)
+  );
+  const threshold = QUALITY_THRESHOLDS[taskClass];
+  const verdict =
+    qualityDefects.length === 0 && missingEvidence.length === 0 && qualityScore >= threshold
+      ? "pass"
+      : response.error?.retryable || qualityDefects.length > 0 || missingEvidence.length > 0
+        ? "retry_step"
+        : "replan_task";
+
+  return {
+    verdict,
+    reason:
+      verdict === "pass"
+        ? `Step satisfies ${taskClass} quality gate`
+        : qualityDefects[0] ?? missingEvidence[0] ?? "Step requires more evidence",
+    missingCriteria,
+    suggestedFix:
+      verdict === "pass"
+        ? ""
+        : taskClass === TaskClass.ResearchBrowser
+          ? "Collect more authoritative sources or usable timeline evidence"
+          : taskClass === TaskClass.CodingPython
+            ? "Regenerate executable code and required artifacts"
+            : taskClass === TaskClass.DocumentExport
+              ? "Regenerate document with readable sections and final artifacts"
+              : "Re-run after approval or collect execution receipt",
+    confidence: verdict === "pass" ? 0.9 : 0.83,
+    qualityScore,
+    qualityDefects,
+    missingEvidence,
+    sourceCoverageScore,
+    formatCompliance
+  };
+};
+
+const mergeVerificationDecision = (
+  baseline: VerificationDecision,
+  candidate: VerificationDecision
+): VerificationDecision => {
+  if (baseline.verdict !== "pass" && candidate.verdict === "pass") {
+    return baseline;
+  }
+
+  return {
+    ...baseline,
+    ...candidate,
+    ...(typeof candidate.qualityScore === "number"
+      ? { qualityScore: candidate.qualityScore }
+      : typeof baseline.qualityScore === "number"
+        ? { qualityScore: baseline.qualityScore }
+        : {}),
+    ...((Array.isArray(candidate.qualityDefects) && candidate.qualityDefects.length > 0)
+      ? { qualityDefects: candidate.qualityDefects }
+      : Array.isArray(baseline.qualityDefects) && baseline.qualityDefects.length > 0
+        ? { qualityDefects: baseline.qualityDefects }
+        : {}),
+    ...((Array.isArray(candidate.missingEvidence) && candidate.missingEvidence.length > 0)
+      ? { missingEvidence: candidate.missingEvidence }
+      : Array.isArray(baseline.missingEvidence) && baseline.missingEvidence.length > 0
+        ? { missingEvidence: baseline.missingEvidence }
+        : {}),
+    ...(typeof candidate.sourceCoverageScore === "number"
+      ? { sourceCoverageScore: candidate.sourceCoverageScore }
+      : typeof baseline.sourceCoverageScore === "number"
+        ? { sourceCoverageScore: baseline.sourceCoverageScore }
+        : {}),
+    ...(candidate.formatCompliance
+      ? { formatCompliance: candidate.formatCompliance }
+      : baseline.formatCompliance
+        ? { formatCompliance: baseline.formatCompliance }
+        : {})
+  };
 };
 
 const findMarkdownArtifactForPdfExport = (input: AgentRequest): string | undefined => {
@@ -1372,6 +2082,22 @@ const buildCodingFallbackReason = (
   return summarizeLlmFallbackReason(error, draft.fallbackKind === "pdf" ? "pdf" : "coding");
 };
 
+const isPythonSyntaxFailure = (response: ToolResponse): boolean => {
+  const haystack = [
+    response.summary,
+    typeof response.output?.stderr === "string" ? response.output.stderr : "",
+    typeof response.error?.message === "string" ? response.error.message : ""
+  ]
+    .join("\n")
+    .toLowerCase();
+  return (
+    haystack.includes("syntaxerror") ||
+    haystack.includes("eol while scanning string literal") ||
+    haystack.includes("unterminated string") ||
+    haystack.includes("indentationerror")
+  );
+};
+
 const buildSimpleDocumentPlan = (goal: string): Plan => ({
   goal,
   assumptions: ["No external side effects are required", "Return the requested output directly"],
@@ -1404,22 +2130,53 @@ const buildNextPlanStepId = (steps: Plan["steps"]): string => {
   return `${match[1]}${Number(match[2]) + 1}`;
 };
 
+const PDF_EXPORT_STEP_HINT_PATTERN = /(导出|export|排版|render|print|生成.*pdf|输出.*pdf)/i;
+const PDF_PREPARATION_HINT_PATTERN =
+  /(准备文稿|准备markdown|markdown 摘要|markdown 简报|prepare.*markdown|prepare.*document|for final pdf export)/i;
+
+const isExplicitPdfExportPlanStep = (
+  step: {
+    title?: string;
+    objective?: string;
+    expectedOutput?: string;
+    successCriteria?: string[];
+  }
+): boolean => {
+  const title = step.title ?? "";
+  const objective = step.objective ?? "";
+  const expectedOutput = step.expectedOutput ?? "";
+  const successCriteria = Array.isArray(step.successCriteria) ? step.successCriteria.join("\n") : "";
+  const titleAndOutputText = [title, expectedOutput, successCriteria].join("\n");
+
+  if (hasKeyword(titleAndOutputText, PDF_KEYWORDS)) {
+    return true;
+  }
+
+  return (
+    hasKeyword(objective, PDF_KEYWORDS) &&
+    PDF_EXPORT_STEP_HINT_PATTERN.test(objective) &&
+    !PDF_PREPARATION_HINT_PATTERN.test(objective)
+  );
+};
+
+const findLastExplicitPdfExportStepIndex = (steps: Plan["steps"]): number => {
+  for (let index = steps.length - 1; index >= 0; index -= 1) {
+    const step = steps[index];
+    if (step && isExplicitPdfExportPlanStep(step)) {
+      return index;
+    }
+  }
+
+  return -1;
+};
+
 const normalizePdfExportSteps = (goal: string, plan: Plan): Plan => {
   if (!hasKeyword(goal, PDF_KEYWORDS)) {
     return plan;
   }
 
   const normalizedSteps = plan.steps.map((step) => {
-    const stepText = [
-      step.title,
-      step.objective,
-      step.expectedOutput,
-      ...step.successCriteria
-    ].join("\n");
-    const isPdfStep = hasKeyword(stepText, PDF_KEYWORDS);
-    const isExplicitExportStep = /(导出|export|排版)/i.test(stepText);
-
-    if (!isPdfStep || !isExplicitExportStep || step.agent === AgentKind.Coding) {
+    if (!isExplicitPdfExportPlanStep(step) || step.agent === AgentKind.Coding) {
       return step;
     }
 
@@ -1447,12 +2204,7 @@ const ensurePdfExportStep = (goal: string, plan: Plan): Plan => {
     return plan;
   }
 
-  const hasPdfStep = plan.steps.some((step) =>
-    hasKeyword(
-      [step.title, step.objective, step.expectedOutput, ...step.successCriteria].join("\n"),
-      PDF_KEYWORDS
-    )
-  );
+  const hasPdfStep = findLastExplicitPdfExportStepIndex(plan.steps) !== -1;
   if (hasPdfStep) {
     return plan;
   }
@@ -1546,9 +2298,7 @@ const ensureDocumentBeforePdfStep = (goal: string, plan: Plan): Plan => {
     return plan;
   }
 
-  const pdfStepIndex = plan.steps.findIndex((step) =>
-    hasKeyword([step.title, step.objective, step.expectedOutput, ...step.successCriteria].join("\n"), PDF_KEYWORDS)
-  );
+  const pdfStepIndex = findLastExplicitPdfExportStepIndex(plan.steps);
   if (pdfStepIndex === -1) {
     return plan;
   }
@@ -1558,17 +2308,17 @@ const ensureDocumentBeforePdfStep = (goal: string, plan: Plan): Plan => {
     return plan;
   }
 
-  const dependencyStep =
-    [...plan.steps.slice(0, pdfStepIndex)].reverse().find((step) => step.agent !== AgentKind.Action) ??
-    plan.steps.at(pdfStepIndex - 1);
+  const dependencyStep = [...plan.steps.slice(0, pdfStepIndex)]
+    .reverse()
+    .find((step) => step.agent !== AgentKind.Action && step.agent !== AgentKind.Document);
   const documentStepId = `${pdfStep.id}_doc`;
   const documentStep: Plan["steps"][number] = {
     id: documentStepId,
     title: "生成 Markdown 摘要",
     agent: AgentKind.Document,
     objective: "基于前序分析结果生成结构化 Markdown 摘要，为最终 PDF 导出准备文稿。",
-    dependsOn: dependencyStep ? [dependencyStep.id] : pdfStep.dependsOn,
-    inputs: dependencyStep ? [`${dependencyStep.id} 结构化结果`] : pdfStep.inputs,
+    dependsOn: dependencyStep ? [dependencyStep.id] : [...pdfStep.dependsOn],
+    inputs: dependencyStep ? [`${dependencyStep.id} 结构化结果`] : [...pdfStep.inputs],
     expectedOutput: "Markdown 简报文稿。",
     successCriteria: [
       "生成结构清晰的 Markdown 摘要",
@@ -1591,7 +2341,37 @@ const ensureDocumentBeforePdfStep = (goal: string, plan: Plan): Plan => {
   };
 };
 
-const sanitizePlannedTask = (goal: string, plan: Plan): Plan => {
+const applyRecipeOverrides = (
+  goal: string,
+  plan: Plan,
+  recipe?: RecipeDefinition
+): Plan => {
+  if (!recipe) {
+    return plan;
+  }
+
+  return {
+    ...plan,
+    steps: plan.steps.map((step) => {
+      const taskClass = step.taskClass ?? classifyTaskClass(goal, step);
+      const qualityProfile =
+        taskClass === recipe.taskClass
+          ? {
+              ...(recipe.qualityProfileOverrides ?? {}),
+              ...(step.qualityProfile ?? {})
+            }
+          : step.qualityProfile;
+
+      return {
+        ...step,
+        ...(taskClass ? { taskClass } : {}),
+        ...(qualityProfile && Object.keys(qualityProfile).length > 0 ? { qualityProfile } : {})
+      };
+    })
+  };
+};
+
+const sanitizePlannedTask = (goal: string, plan: Plan, recipe?: RecipeDefinition): Plan => {
   let sanitizedPlan = normalizePdfExportSteps(goal, plan);
 
   if (!hasKeyword(goal, SIDE_EFFECT_KEYWORDS)) {
@@ -1618,9 +2398,23 @@ const sanitizePlannedTask = (goal: string, plan: Plan): Plan => {
     }
   }
 
+  sanitizedPlan = applyRecipeOverrides(goal, sanitizedPlan, recipe);
   sanitizedPlan = normalizeDirectExecutionSteps(goal, sanitizedPlan);
   sanitizedPlan = ensurePdfExportStep(goal, sanitizedPlan);
-  return ensureDocumentBeforePdfStep(goal, sanitizedPlan);
+  sanitizedPlan = ensureDocumentBeforePdfStep(goal, sanitizedPlan);
+
+  return {
+    ...sanitizedPlan,
+    steps: sanitizedPlan.steps.map((step) => {
+      const taskClass = step.taskClass ?? classifyTaskClass(goal, step);
+      return {
+        ...step,
+        taskClass,
+        qualityProfile: step.qualityProfile ?? buildQualityProfile(taskClass, goal, step),
+        attemptStrategy: step.attemptStrategy ?? buildAttemptStrategy(taskClass, step.agent, 0)
+      };
+    })
+  };
 };
 
 const buildExecutionQuery = (input: AgentRequest): string => {
@@ -1634,6 +2428,27 @@ const buildExecutionQuery = (input: AgentRequest): string => {
       (value): value is string => typeof value === "string" && value.length > 0
     )
   ).join("\n");
+};
+
+const buildFocusedResearchQueries = (input: AgentRequest): string[] => {
+  const baseQuery = buildExecutionQuery(input);
+  const normalizedGoal = stripTaskPrefix(input.goal);
+  const lines = normalizedGoal
+    .split(/\r?\n|(?<=[:：])|(?<=。)|(?<=；)|(?<=;)/)
+    .map((line) => line.trim())
+    .filter((line) => line.length >= 12);
+  const numberedRequirements = normalizedGoal
+    .split(/\n/)
+    .map((line) => line.trim())
+    .filter((line) => /^(\d+[\).、]|[-*])/.test(line));
+
+  const candidates = uniqueStrings([
+    baseQuery,
+    ...numberedRequirements.slice(0, 2).map((item) => `${baseQuery}\n${item}`),
+    ...lines.slice(0, 2).map((item) => `${baseQuery}\n${item}`)
+  ]).filter((query) => query.length > 0);
+
+  return candidates.slice(0, baseQuery.length > 180 ? 3 : 2);
 };
 
 const extractHttpUrls = (text: string): string[] =>
@@ -1684,6 +2499,7 @@ const buildBrowserFallbackResponse = (params: {
   toolResponse: Awaited<ReturnType<ToolRuntime["execute"]>>;
   selectedUrl: string;
   attemptSummaries: JsonObject[];
+  inheritedSources?: Array<{ title: string; url: string; snippet: string; tier: string }>;
   bootstrapSearchSummary?: string;
   fallbackReason: string;
 }): AgentResponse => {
@@ -1691,6 +2507,19 @@ const buildBrowserFallbackResponse = (params: {
   const pageTitle = String(params.toolResponse.output?.pageTitle ?? "");
   const extractedText = String(params.toolResponse.output?.extractedText ?? "");
   const extractedFacts = extractBrowserFactSnippets(extractedText);
+  const sources = dedupeSourceEvidence([
+    ...(params.inheritedSources ?? []),
+    ...(currentUrl
+      ? [
+          {
+            title: pageTitle || "Browser extract",
+            url: currentUrl,
+            snippet: extractedText,
+            tier: classifySourceTier(currentUrl)
+          }
+        ]
+      : [])
+  ]);
   const evidencePoints = uniqueStrings(
     [
       pageTitle ? `页面标题：${pageTitle}` : "",
@@ -1705,10 +2534,18 @@ const buildBrowserFallbackResponse = (params: {
       ? `已从 ${pageTitle} 提取页面内容，并使用规则化摘要继续任务`
       : "已提取页面内容，并使用规则化摘要继续任务",
     structuredData: {
+      taskClass: TaskClass.ResearchBrowser,
       currentUrl,
+      sourceUrls: [currentUrl],
+      sources,
+      sourceTiers: sources.map((source) => ({ url: source.url, tier: source.tier })),
       pageTitle,
       evidencePoints,
       extractedFacts,
+      timelineEvents: buildTimelineEventsFromSources(
+        [{ title: pageTitle, snippet: extractedText, url: currentUrl }],
+        4
+      ),
       nextQuestions: [],
       extractedText,
       attemptSummaries: params.attemptSummaries,
@@ -1719,6 +2556,75 @@ const buildBrowserFallbackResponse = (params: {
         : {})
     },
     ...(params.toolResponse.artifacts ? { artifacts: params.toolResponse.artifacts } : {})
+  };
+};
+
+const buildEvidenceOnlyBrowserFallback = (
+  input: AgentRequest,
+  attemptSummaries: JsonObject[],
+  reason: string
+): AgentResponse | undefined => {
+  const previousEvidence = Array.isArray(input.context["previousStepEvidence"])
+    ? input.context["previousStepEvidence"]
+    : [];
+  const researchEvidence = previousEvidence.find(
+    (item) =>
+      item &&
+      typeof item === "object" &&
+      (item as Record<string, unknown>)["taskClass"] === TaskClass.ResearchBrowser
+  ) as Record<string, unknown> | undefined;
+  if (!researchEvidence) {
+    return undefined;
+  }
+
+  const findings = Array.isArray(researchEvidence["findings"])
+    ? researchEvidence["findings"].map(String).slice(0, 8)
+    : [];
+  const sources = Array.isArray(researchEvidence["sources"])
+    ? researchEvidence["sources"].slice(0, 8)
+    : [];
+  const timelineEvents = Array.isArray(researchEvidence["timelineEvents"])
+    ? researchEvidence["timelineEvents"].slice(0, 8)
+    : [];
+  if (findings.length === 0 && sources.length === 0) {
+    return undefined;
+  }
+
+  return {
+    status: "success",
+    summary: "浏览器抽取受阻，已基于上一阶段研究证据继续任务",
+    structuredData: {
+      taskClass: TaskClass.ResearchBrowser,
+      currentUrl: typeof researchEvidence["topResultUrl"] === "string" ? researchEvidence["topResultUrl"] : "",
+      sourceUrls: sources
+        .flatMap((item) =>
+          item &&
+          typeof item === "object" &&
+          typeof (item as Record<string, unknown>)["url"] === "string"
+            ? [String((item as Record<string, unknown>)["url"])]
+            : []
+        )
+        .slice(0, 8),
+      sources,
+      sourceTiers: sources
+        .flatMap((item) => {
+          const candidate = asJsonObject(item);
+          const url = asOptionalString(candidate["url"]);
+          const tier = asOptionalString(candidate["tier"]) ?? (url ? classifySourceTier(url) : undefined);
+          return url && tier ? [{ url, tier }] : [];
+        })
+        .slice(0, 8),
+      pageTitle: "Evidence fallback",
+      evidencePoints: findings.slice(0, 6),
+      extractedFacts: findings,
+      timelineEvents,
+      nextQuestions: [],
+      attemptSummaries,
+      synthesisFallbackUsed: true,
+      synthesisFallbackReason: reason,
+      browserFallbackUsed: true,
+      fallbackKind: "evidence_only_browser"
+    }
   };
 };
 
@@ -1737,6 +2643,50 @@ const goalRequestsLinks = (goal: string): boolean =>
     "来源",
     "出处"
   ]);
+
+const dedupeSourceEvidence = (
+  sources: Array<{ title: string; url: string; snippet: string; tier: string }>
+): Array<{ title: string; url: string; snippet: string; tier: string }> => {
+  const seen = new Set<string>();
+  const deduped: Array<{ title: string; url: string; snippet: string; tier: string }> = [];
+  for (const source of sources) {
+    if (!source.url || seen.has(source.url)) {
+      continue;
+    }
+    seen.add(source.url);
+    deduped.push(source);
+  }
+  return deduped;
+};
+
+const extractInheritedResearchSources = (
+  input: AgentRequest
+): Array<{ title: string; url: string; snippet: string; tier: string }> => {
+  const previousEvidence = Array.isArray(input.context["previousStepEvidence"])
+    ? input.context["previousStepEvidence"]
+    : [];
+  return dedupeSourceEvidence(
+    previousEvidence.flatMap((item) => {
+      const candidate = asJsonObject(item);
+      const sources = Array.isArray(candidate["sources"]) ? candidate["sources"] : [];
+      return sources.flatMap((source) => {
+        const sourceCandidate = asJsonObject(source);
+        const url = asOptionalString(sourceCandidate["url"]);
+        if (!url) {
+          return [];
+        }
+        return [
+          {
+            title: asOptionalString(sourceCandidate["title"]) ?? url,
+            url,
+            snippet: asOptionalString(sourceCandidate["snippet"]) ?? "",
+            tier: asOptionalString(sourceCandidate["tier"]) ?? classifySourceTier(url)
+          }
+        ];
+      });
+    })
+  );
+};
 
 const hasOnlyGenericKeyFindingsSection = (body: string): boolean => {
   const lines = body
@@ -1763,6 +2713,86 @@ const detectDocumentPlaceholderSignals = (goal: string, body: string): string[] 
   }
 
   return signals;
+};
+
+const buildDocumentFallbackDraft = (input: AgentRequest): DocumentDraft => {
+  const previousEvidence = Array.isArray(input.context["previousStepEvidence"])
+    ? input.context["previousStepEvidence"]
+    : [];
+  const previousSummaries = asStringArray(input.context["previousStepSummaries"]);
+  const findings = uniqueStrings(
+    previousEvidence.flatMap((item) => {
+      const candidate = asJsonObject(item);
+      return [
+        ...asStringArray(candidate["findings"]),
+        ...asStringArray(candidate["extractedFacts"])
+      ];
+    })
+  ).slice(0, 12);
+  const sourceUrls = uniqueStrings(
+    previousEvidence.flatMap((item) => {
+      const candidate = asJsonObject(item);
+      const sourceUrls = asStringArray(candidate["sourceUrls"]);
+      const sources = Array.isArray(candidate["sources"])
+        ? candidate["sources"].flatMap((source) => {
+            const sourceCandidate = asJsonObject(source);
+            return typeof sourceCandidate["url"] === "string" ? [String(sourceCandidate["url"])] : [];
+          })
+        : [];
+      return [...sourceUrls, ...sources];
+    })
+  ).slice(0, 10);
+  const timelineEvents = previousEvidence.flatMap((item) => {
+    const candidate = asJsonObject(item);
+    return Array.isArray(candidate["timelineEvents"]) ? candidate["timelineEvents"].slice(0, 6) : [];
+  });
+
+  const sections = [
+    "## 摘要",
+    "",
+    ...(findings.length > 0
+      ? findings.slice(0, 6).map((finding) => `- ${finding}`)
+      : previousSummaries.slice(0, 6).map((summary) => `- ${summary}`)),
+    "",
+    "## 关键证据",
+    "",
+    ...(sourceUrls.length > 0 ? sourceUrls.map((url) => `- ${url}`) : ["- 以上游步骤结构化结果为准"]),
+    ...(timelineEvents.length > 0
+      ? [
+          "",
+          "## 时间线",
+          "",
+          ...timelineEvents.map((item) => {
+            const candidate = asJsonObject(item);
+            return `- ${String(candidate["date"] ?? "")} ${String(candidate["event"] ?? "")}`.trim();
+          })
+        ]
+      : [])
+  ];
+
+  return {
+    summary: "使用结构化证据生成本地文档 fallback",
+    title: stripTaskPrefix(input.goal) || "Task Report",
+    markdownBody: sections.join("\n"),
+    keySections: timelineEvents.length > 0 ? ["摘要", "关键证据", "时间线"] : ["摘要", "关键证据"],
+    usedSources: sourceUrls
+  };
+};
+
+const buildArtifactValidation = (artifacts: string[], preview?: string, keySections: string[] = []) => {
+  const hasArtifact = artifacts.length > 0;
+  const pdfArtifact = artifacts.find((artifact) => artifact.toLowerCase().endsWith(".pdf")) ?? null;
+  const markdownArtifact =
+    artifacts.find((artifact) => artifact.toLowerCase().endsWith(".md")) ?? null;
+  return {
+    hasArtifact,
+    artifactCount: artifacts.length,
+    hasReadablePreview: Boolean(preview && preview.trim().length > 0),
+    hasSections: keySections.length > 0,
+    pdfArtifact,
+    markdownArtifact,
+    validated: hasArtifact && Boolean(preview && preview.trim().length > 0)
+  };
 };
 
 const RESEARCH_SYNTHETIC_MARKER_PATTERN = /\bsynthetic\b/i;
@@ -1813,6 +2843,76 @@ const buildResearchQualityFailure = (
     retryable: false
   }
 });
+
+const extractSentenceLikeSnippets = (text: string, maxItems = 6): string[] =>
+  uniqueStrings(
+    text
+      .split(/\r?\n|(?<=[.!?。！？])\s+/)
+      .map((item) => item.trim())
+      .filter((item) => item.length >= 18)
+      .map((item) => (item.length > 220 ? `${item.slice(0, 217)}...` : item))
+  ).slice(0, maxItems);
+
+const buildResearchFallbackResponse = (params: {
+  sourceCount: number;
+  topResultUrl: string;
+  candidateSourceUrls: string[];
+  searchAnswer: string;
+  results: unknown;
+  sources?: Array<{ title: string; url: string; snippet: string; tier: string }>;
+  timelineEvents?: Array<{ date: string; event: string; sourceUrl: string }>;
+  fallbackReason: string;
+}): AgentResponse => {
+  const results = Array.isArray(params.results) ? params.results : [];
+  const sources = params.sources ?? buildSourceEvidence(results);
+  const timelineEvents = params.timelineEvents ?? buildTimelineEventsFromSources(results);
+  const findingsFromResults = uniqueStrings(
+    results.flatMap((result) => {
+      const candidate = asJsonObject(result);
+      const title = asOptionalString(candidate["title"]) ?? "";
+      const snippet = asOptionalString(candidate["snippet"]) ?? "";
+      const url = asOptionalString(candidate["url"]) ?? "";
+      const combined = [title, snippet].filter(Boolean).join(" - ");
+      if (combined) {
+        return [url ? `${combined} (${url})` : combined];
+      }
+      return url ? [url] : [];
+    })
+  ).slice(0, 6);
+  const findings = findingsFromResults.length > 0
+    ? findingsFromResults
+    : extractSentenceLikeSnippets(params.searchAnswer, 6);
+  const marketSignals = uniqueStrings([
+    ...extractSentenceLikeSnippets(params.searchAnswer, 3),
+    ...findings.map((finding) => finding.replace(/\s*\(https?:\/\/[^\s)]+\)\s*$/i, ""))
+  ]).slice(0, 4);
+  const coverageGaps =
+    findings.length > 0
+      ? []
+      : ["需要进一步补充更细化的来源证据后再形成完整分析。"];
+
+  return {
+    status: "success",
+    summary:
+      params.sourceCount > 0
+        ? `已基于 ${params.sourceCount} 个搜索来源生成规则化研究摘要并继续任务`
+        : "已基于搜索结果生成规则化研究摘要并继续任务",
+    structuredData: {
+      taskClass: TaskClass.ResearchBrowser,
+      sourceCount: params.sourceCount,
+      topResultUrl: params.topResultUrl,
+      candidateSourceUrls: params.candidateSourceUrls,
+      sources,
+      sourceTiers: sources.map((source) => ({ url: source.url, tier: source.tier })),
+      findings,
+      marketSignals,
+      coverageGaps,
+      timelineEvents,
+      synthesisFallbackUsed: true,
+      synthesisFallbackReason: params.fallbackReason
+    }
+  };
+};
 
 export class RouterAgent implements RoutingAgent {
   constructor(
@@ -1898,6 +2998,11 @@ export class PlannerAgent implements PlanningAgent {
   ) {}
 
   async createPlan(goal: string, context: JsonObject): Promise<Plan> {
+    const explicitRecipeId = asOptionalString(context["recipeId"]);
+    const recipe = getRecipeById(explicitRecipeId) ?? matchRecipeForGoal(goal);
+    const recipeContext = recipe
+      ? buildRecipePlanningContext(recipe.id)
+      : {};
     if (this.mode === "live" && this.llmClient?.isConfigured()) {
       try {
         const response = await this.llmClient.generateJson<Plan>({
@@ -1912,7 +3017,10 @@ export class PlannerAgent implements PlanningAgent {
               content: JSON.stringify(
                 {
                   goal,
-                  context,
+                  context: {
+                    ...context,
+                    ...recipeContext
+                  },
                   allowedAgents: AGENT_KIND_VALUES
                 },
                 null,
@@ -1933,16 +3041,16 @@ export class PlannerAgent implements PlanningAgent {
             ...step,
             agent: coerceAgentKind(step.agent)
           }))
-        });
+        }, recipe);
       } catch {
-        return this.mockPlan(goal);
+        return this.mockPlan(goal, recipe);
       }
     }
 
-    return this.mockPlan(goal);
+    return this.mockPlan(goal, recipe);
   }
 
-  private mockPlan(goal: string): Plan {
+  private mockPlan(goal: string, recipe?: RecipeDefinition): Plan {
     const normalizedGoal = stripTaskPrefix(goal);
     const includesCoding = hasKeyword(normalizedGoal, CODING_KEYWORDS);
     const includesResearch = hasKeyword(normalizedGoal, [
@@ -2064,12 +3172,114 @@ export class PlannerAgent implements PlanningAgent {
       });
     }
 
-    return {
+    return sanitizePlannedTask(goal, {
       goal,
       assumptions: ["Public information only", "Chinese output by default"],
       steps,
       taskSuccessCriteria: ["Task completes without manual intervention", "At least one final artifact exists"]
+    }, recipe);
+  }
+}
+
+export class ReplannerAgent implements ReplanningAgent {
+  constructor(
+    private readonly modelRouter: ModelRouter,
+    private readonly llmClient?: OpenAIResponsesClient,
+    private readonly mode: AgentExecutionMode = "mock"
+  ) {}
+
+  async repairPlan(task: Task, failedStep: TaskStep, context: JsonObject): Promise<Plan> {
+    const completedSteps = task.steps.filter((step) => step.status === StepStatus.Completed);
+    const recipe = getRecipeById(task.recipeId) ?? matchRecipeForGoal(task.goal);
+    const completedIds = new Set(completedSteps.map((step) => step.id));
+
+    if (this.mode === "live" && this.llmClient?.isConfigured()) {
+      try {
+        const response = await this.llmClient.generateJson<Plan>({
+          stage: "replanner",
+          messages: [
+            {
+              role: "system",
+              content: REPLANNER_PROMPT_TEMPLATE
+            },
+            {
+              role: "user",
+              content: JSON.stringify(
+                {
+                  goal: task.goal,
+                  failedStep: {
+                    id: failedStep.id,
+                    title: failedStep.title,
+                    agent: failedStep.agent,
+                    objective: failedStep.objective,
+                    summary: failedStep.summary,
+                    error: failedStep.error ?? null
+                  },
+                  completedSteps: completedSteps.map((step) => ({
+                    id: step.id,
+                    title: step.title,
+                    agent: step.agent,
+                    taskClass: step.taskClass ?? null,
+                    summary: step.summary ?? null,
+                    outputArtifacts: step.outputArtifacts
+                  })),
+                  currentPlan: task.plan,
+                  context,
+                  recipe: recipe ? buildRecipePlanningContext(recipe.id)["recipe"] : null
+                },
+                null,
+                2
+              )
+            }
+          ],
+          jsonSchema: {
+            name: "replanned_task",
+            schema: PLAN_SCHEMA
+          },
+          maxOutputTokens: 1_500,
+          timeoutMs: this.modelRouter.getRequestTimeoutMs("planner", TaskClass.ResearchBrowser)
+        });
+
+        const sanitized = sanitizePlannedTask(
+          task.goal,
+          {
+            ...response.data,
+            steps: response.data.steps.map((step) => ({
+              ...step,
+              agent: coerceAgentKind(step.agent)
+            }))
+          },
+          recipe
+        );
+        return {
+          ...sanitized,
+          steps: sanitized.steps.filter((step) => !completedIds.has(step.id))
+        };
+      } catch {
+        // fall through
+      }
+    }
+
+    const originalSteps = task.plan.steps;
+    const failedIndex = originalSteps.findIndex((step) => step.id === failedStep.id);
+    const suffixSteps = originalSteps.slice(Math.max(0, failedIndex));
+    const repairedSteps = suffixSteps.map((step, index) => ({
+      ...step,
+      id: `${failedStep.id}r${index + 1}`,
+      dependsOn: index === 0
+        ? completedSteps.map((completed) => completed.id).slice(-2)
+        : [`${failedStep.id}r${index}`]
+    }));
+    const fallbackPlan: Plan = {
+      goal: task.goal,
+      assumptions: [
+        ...task.plan.assumptions,
+        `Replanned after ${failedStep.id} failed`
+      ],
+      steps: repairedSteps,
+      taskSuccessCriteria: task.plan.taskSuccessCriteria
     };
+    return sanitizePlannedTask(task.goal, fallbackPlan, recipe);
   }
 }
 
@@ -2084,34 +3294,79 @@ export class ResearchAgent implements StepAgent {
   ) {}
 
   async execute(input: AgentRequest): Promise<AgentResponse> {
-    const toolResponse = await this.toolRuntime.execute({
-      taskId: input.taskId,
-      stepId: input.stepId ?? "unknown-step",
-      toolName: ToolName.Search,
-      action: "search_web",
-      input: {
-        query: buildExecutionQuery(input)
-      },
-      callerAgent: this.kind
-    });
+    const searchQueries =
+      this.mode === "live" ? buildFocusedResearchQueries(input) : [buildExecutionQuery(input)];
+    const searchResponses = await Promise.all(
+      searchQueries.map((query, index) =>
+        this.toolRuntime.execute({
+          taskId: input.taskId,
+          stepId: input.stepId ?? "unknown-step",
+          toolName: ToolName.Search,
+          action: "search_web",
+          input: {
+            query,
+            subqueryIndex: index + 1,
+            totalSubqueries: searchQueries.length
+          },
+          callerAgent: this.kind
+        })
+      )
+    );
+    const successfulSearchResponses = searchResponses.filter(
+      (response) => response.status === "success"
+    );
+    const toolResponse =
+      successfulSearchResponses[0] ??
+      searchResponses.at(0) ?? {
+        status: "failed" as const,
+        summary: "research search failed",
+        output: {},
+        error: {
+          code: ErrorCode.NetworkError,
+          message: "research search failed",
+          retryable: true
+        }
+      };
 
-    const firstResult = Array.isArray(toolResponse.output?.results)
-      ? (toolResponse.output?.results[0] as JsonObject | undefined)
-      : undefined;
+    const mergedResults = uniqueStrings(
+      searchResponses.flatMap((response) => {
+        const results = Array.isArray(response.output?.results) ? response.output.results : [];
+        return results.map((result) => JSON.stringify(result));
+      })
+    ).map((serialized) => JSON.parse(serialized) as JsonObject);
+    const firstResult = mergedResults[0];
     const topResultUrl = typeof firstResult?.url === "string" ? firstResult.url : "";
-    const candidateSourceUrls = collectSearchResultUrls(toolResponse.output?.results);
-    const sourceCount = Array.isArray(toolResponse.output?.results)
-      ? toolResponse.output.results.length
-      : 0;
+    const candidateSourceUrls = collectSearchResultUrls(mergedResults);
+    const sources = buildSourceEvidence(mergedResults);
+    const timelineEvents = buildTimelineEventsFromSources(mergedResults);
+    const sourceCount = sources.length;
+    const sourceTiers = sources.map((source) => ({ url: source.url, tier: source.tier }));
+    const searchAnswer = uniqueStrings(
+      searchResponses.flatMap((response) => {
+        const answer = typeof response.output?.answer === "string" ? response.output.answer : "";
+        return answer ? [answer] : [];
+      })
+    ).join("\n\n");
+    const searchSummary = uniqueStrings(searchResponses.map((response) => response.summary).filter(Boolean)).join(
+      " | "
+    );
     const researchPayload: JsonObject = {
       goal: input.goal,
-      searchSummary: toolResponse.summary,
-      searchAnswer: typeof toolResponse.output?.answer === "string"
-        ? toolResponse.output.answer
-        : "",
-      results: Array.isArray(toolResponse.output?.results)
-        ? toolResponse.output.results
-        : []
+      currentStep: asJsonObject(input.context["currentStep"]),
+      previousStepSummaries: asStringArray(input.context["previousStepSummaries"]),
+      taskMemorySummaries: asStringArray(input.context["taskMemorySummaries"]),
+      uploadedArtifactSummaries: Array.isArray(input.context["uploadedArtifactSummaries"])
+        ? input.context["uploadedArtifactSummaries"]
+        : [],
+      previousStepEvidence: Array.isArray(input.context["previousStepEvidence"])
+        ? input.context["previousStepEvidence"]
+        : [],
+      searchQueries,
+      searchSummary,
+      searchAnswer,
+      results: mergedResults,
+      sources,
+      timelineEvents
     };
 
     if (toolResponse.status === "success" && canUseLiveLlm(this.mode, this.llmClient)) {
@@ -2132,25 +3387,35 @@ export class ResearchAgent implements StepAgent {
             name: "research_synthesis",
             schema: RESEARCH_SYNTHESIS_SCHEMA
           },
-          maxOutputTokens: 1_000
+          maxOutputTokens: 1_200,
+          timeoutMs: this.modelRouter.getRequestTimeoutMs("research", TaskClass.ResearchBrowser)
         });
+        const normalizedSynthesis = validateResearchSynthesis(synthesis.data as unknown);
 
         const structuredData: JsonObject = {
+          taskClass: TaskClass.ResearchBrowser,
+          qualityProfile: asJsonObject(asJsonObject(input.context["currentStep"])["qualityProfile"]),
           sourceCount,
-          topResultUrl: synthesis.data.topResultUrl || topResultUrl,
+          topResultUrl: normalizedSynthesis.topResultUrl || topResultUrl,
           candidateSourceUrls,
-          findings: synthesis.data.findings,
-          marketSignals: synthesis.data.marketSignals,
-          coverageGaps: synthesis.data.coverageGaps
+          sources,
+          sourceTiers,
+          findings: normalizedSynthesis.findings,
+          marketSignals: normalizedSynthesis.marketSignals,
+          coverageGaps: normalizedSynthesis.coverageGaps,
+          timelineEvents:
+            normalizedSynthesis.timelineEvents.length > 0
+              ? normalizedSynthesis.timelineEvents
+              : timelineEvents
         };
-        const qualitySignals = detectResearchQualitySignals(sourceCount, synthesis.data.findings);
+        const qualitySignals = detectResearchQualitySignals(sourceCount, normalizedSynthesis.findings);
         if (qualitySignals.length > 0) {
           return buildResearchQualityFailure(structuredData, qualitySignals);
         }
 
         return {
           status: "success",
-          summary: synthesis.data.summary,
+          summary: normalizedSynthesis.summary,
           structuredData
         };
       } catch (error) {
@@ -2166,9 +3431,15 @@ export class ResearchAgent implements StepAgent {
               sourceCount,
               topResultUrl: recoveredSynthesis.topResultUrl || topResultUrl,
               candidateSourceUrls,
+              sources,
+              sourceTiers,
               findings: recoveredSynthesis.findings,
               marketSignals: recoveredSynthesis.marketSignals,
-              coverageGaps: recoveredSynthesis.coverageGaps
+              coverageGaps: recoveredSynthesis.coverageGaps,
+              timelineEvents:
+                recoveredSynthesis.timelineEvents.length > 0
+                  ? recoveredSynthesis.timelineEvents
+                  : timelineEvents
             };
             const qualitySignals = detectResearchQualitySignals(
               sourceCount,
@@ -2184,6 +3455,22 @@ export class ResearchAgent implements StepAgent {
               structuredData
             };
           } catch (recoveryError) {
+            const fallbackResponse = buildResearchFallbackResponse({
+              sourceCount,
+              topResultUrl,
+              candidateSourceUrls,
+              searchAnswer,
+              results: mergedResults,
+              sources,
+              timelineEvents,
+              fallbackReason: `research_json_recovery_failed: ${getErrorMessage(recoveryError)}`
+            });
+            const fallbackFindings = asFindingsArray(fallbackResponse.structuredData?.findings);
+            const qualitySignals = detectResearchQualitySignals(sourceCount, fallbackFindings);
+            if (fallbackFindings.length > 0 && qualitySignals.length === 0) {
+              return fallbackResponse;
+            }
+
             return buildResearchRecoveryFailure(error, recoveryError, {
               sourceCount,
               topResultUrl,
@@ -2195,7 +3482,9 @@ export class ResearchAgent implements StepAgent {
         return buildLiveSynthesisFailure("research", error, {
           sourceCount,
           topResultUrl,
-          candidateSourceUrls
+          candidateSourceUrls,
+          sources,
+          timelineEvents
         });
       }
     }
@@ -2208,7 +3497,10 @@ export class ResearchAgent implements StepAgent {
           stage: "research_search",
           sourceCount,
           topResultUrl,
-          candidateSourceUrls
+          candidateSourceUrls,
+          sources,
+          sourceTiers,
+          timelineEvents
         },
         ...(toolResponse.error
           ? { error: toolResponse.error }
@@ -2227,10 +3519,14 @@ export class ResearchAgent implements StepAgent {
         ? toolResponse.output.answer
         : "Synthetic findings: premium EV rental, airport delivery, and monthly subscriptions matter.";
     const structuredData: JsonObject = {
+      taskClass: TaskClass.ResearchBrowser,
       sourceCount,
       topResultUrl,
       candidateSourceUrls,
-      findings
+      sources,
+      sourceTiers,
+      findings,
+      timelineEvents
     };
 
     if (this.mode === "live") {
@@ -2267,6 +3563,7 @@ export class BrowserAgent implements StepAgent {
   ) {}
 
   async execute(input: AgentRequest): Promise<AgentResponse> {
+    const inheritedSources = extractInheritedResearchSources(input);
     let candidateUrls = getBrowserCandidateUrls(input.context);
     let bootstrapSearchSummary: string | undefined;
 
@@ -2296,7 +3593,8 @@ export class BrowserAgent implements StepAgent {
                   content: buildBrowserUrlSuggestionPrompt(input)
                 }
               ],
-              maxOutputTokens: 600
+              maxOutputTokens: 600,
+              timeoutMs: this.modelRouter.getRequestTimeoutMs("browser", TaskClass.ResearchBrowser)
             });
             const suggestedUrls = extractHttpUrls(suggestion.outputText);
             if (suggestedUrls.length > 0) {
@@ -2330,6 +3628,14 @@ export class BrowserAgent implements StepAgent {
     }
 
     if (candidateUrls.length === 0) {
+      const evidenceFallback = buildEvidenceOnlyBrowserFallback(
+        input,
+        [],
+        "no_candidate_urls"
+      );
+      if (evidenceFallback) {
+        return evidenceFallback;
+      }
       return {
         status: "failed",
         summary: "Browser extraction has no candidate URLs to inspect",
@@ -2346,6 +3652,7 @@ export class BrowserAgent implements StepAgent {
     let toolResponse = undefined as Awaited<ReturnType<ToolRuntime["execute"]>> | undefined;
     let selectedUrl = candidateUrls[0] ?? fallbackUrl;
     let selectedBlockedReason: string | undefined;
+    let selectedNonSubstantiveReason: string | undefined;
 
     for (let index = 0; index < candidateUrls.length; index += 1) {
       const candidateUrl = candidateUrls[index] ?? fallbackUrl;
@@ -2368,6 +3675,10 @@ export class BrowserAgent implements StepAgent {
         attemptResponse.status === "success"
           ? detectBlockedPageReason(pageTitle, extractedText, currentUrl)
           : undefined;
+      const nonSubstantiveReason =
+        attemptResponse.status === "success" && !blockedReason
+          ? detectNonSubstantivePageReason(pageTitle, extractedText, currentUrl)
+          : undefined;
 
       attemptSummaries.push({
         url: candidateUrl,
@@ -2375,6 +3686,7 @@ export class BrowserAgent implements StepAgent {
         pageTitle,
         currentUrl,
         ...(blockedReason ? { blockedReason } : {}),
+        ...(nonSubstantiveReason ? { nonSubstantiveReason } : {}),
         ...(attemptResponse.error ? { error: attemptResponse.error.message } : {})
       });
 
@@ -2391,9 +3703,17 @@ export class BrowserAgent implements StepAgent {
         continue;
       }
 
+      if (nonSubstantiveReason) {
+        toolResponse = attemptResponse;
+        selectedUrl = candidateUrl;
+        selectedNonSubstantiveReason = nonSubstantiveReason;
+        continue;
+      }
+
       toolResponse = attemptResponse;
       selectedUrl = candidateUrl;
       selectedBlockedReason = undefined;
+      selectedNonSubstantiveReason = undefined;
       break;
     }
 
@@ -2414,20 +3734,34 @@ export class BrowserAgent implements StepAgent {
       };
     }
 
-    if (selectedBlockedReason) {
+    if (selectedBlockedReason || selectedNonSubstantiveReason) {
+      const evidenceFallback = buildEvidenceOnlyBrowserFallback(
+        input,
+        attemptSummaries,
+        selectedBlockedReason ?? selectedNonSubstantiveReason ?? "browser evidence unavailable"
+      );
+      if (evidenceFallback) {
+        return evidenceFallback;
+      }
       return {
         status: "failed",
-        summary: "Browser extraction only found blocked or challenge pages",
+        summary: "Browser extraction only found blocked or low-substance pages",
         structuredData: {
           attemptSummaries,
           candidateUrls,
-          blockedReason: selectedBlockedReason,
+          ...(selectedBlockedReason ? { blockedReason: selectedBlockedReason } : {}),
+          ...(selectedNonSubstantiveReason
+            ? { nonSubstantiveReason: selectedNonSubstantiveReason }
+            : {}),
           ...(bootstrapSearchSummary ? { bootstrapSearchSummary } : {})
         },
         ...(toolResponse.artifacts ? { artifacts: toolResponse.artifacts } : {}),
         error: {
           code: ErrorCode.ToolUnavailable,
-          message: selectedBlockedReason,
+          message:
+            selectedBlockedReason ??
+            selectedNonSubstantiveReason ??
+            "Browser extraction could not find a substantive page",
           retryable: false
         }
       };
@@ -2460,18 +3794,77 @@ export class BrowserAgent implements StepAgent {
             name: "browser_synthesis",
             schema: BROWSER_SYNTHESIS_SCHEMA
           },
-          maxOutputTokens: 1_000
+          maxOutputTokens: 1_000,
+          timeoutMs: this.modelRouter.getRequestTimeoutMs("browser", TaskClass.ResearchBrowser)
         });
 
         return {
           status: "success",
           summary: synthesis.data.summary,
           structuredData: {
+            taskClass: TaskClass.ResearchBrowser,
             currentUrl:
               synthesis.data.currentUrl || String(toolResponse.output?.currentUrl ?? selectedUrl),
             pageTitle: synthesis.data.pageTitle || String(toolResponse.output?.pageTitle ?? ""),
+            sourceUrls: uniqueStrings(
+              dedupeSourceEvidence([
+                ...inheritedSources,
+                {
+                  title:
+                    synthesis.data.pageTitle || String(toolResponse.output?.pageTitle ?? ""),
+                  url:
+                    synthesis.data.currentUrl ||
+                    String(toolResponse.output?.currentUrl ?? selectedUrl),
+                  snippet: `${synthesis.data.summary}\n${synthesis.data.extractedFacts.join(" ")}`,
+                  tier: classifySourceTier(
+                    synthesis.data.currentUrl ||
+                      String(toolResponse.output?.currentUrl ?? selectedUrl)
+                  )
+                }
+              ]).map((source) => source.url)
+            ),
+            sources: dedupeSourceEvidence([
+              ...inheritedSources,
+              {
+                title: synthesis.data.pageTitle || String(toolResponse.output?.pageTitle ?? ""),
+                url:
+                  synthesis.data.currentUrl ||
+                  String(toolResponse.output?.currentUrl ?? selectedUrl),
+                snippet: `${synthesis.data.summary}\n${synthesis.data.extractedFacts.join(" ")}`,
+                tier: classifySourceTier(
+                  synthesis.data.currentUrl ||
+                    String(toolResponse.output?.currentUrl ?? selectedUrl)
+                )
+              }
+            ]),
+            sourceTiers: dedupeSourceEvidence([
+              ...inheritedSources,
+              {
+                title: synthesis.data.pageTitle || String(toolResponse.output?.pageTitle ?? ""),
+                url:
+                  synthesis.data.currentUrl ||
+                  String(toolResponse.output?.currentUrl ?? selectedUrl),
+                snippet: `${synthesis.data.summary}\n${synthesis.data.extractedFacts.join(" ")}`,
+                tier: classifySourceTier(
+                  synthesis.data.currentUrl ||
+                    String(toolResponse.output?.currentUrl ?? selectedUrl)
+                )
+              }
+            ]).map((source) => ({ url: source.url, tier: source.tier })),
             evidencePoints: synthesis.data.evidencePoints,
             extractedFacts: synthesis.data.extractedFacts,
+            timelineEvents: buildTimelineEventsFromSources(
+              [
+                {
+                  title: synthesis.data.pageTitle,
+                  snippet: `${synthesis.data.summary}\n${synthesis.data.extractedFacts.join(" ")}`,
+                  url:
+                    synthesis.data.currentUrl ||
+                    String(toolResponse.output?.currentUrl ?? selectedUrl)
+                }
+              ],
+              4
+            ),
             nextQuestions: synthesis.data.nextQuestions,
             extractedText: String(toolResponse.output?.extractedText ?? ""),
             attemptSummaries,
@@ -2492,13 +3885,78 @@ export class BrowserAgent implements StepAgent {
               status: "success",
               summary: recoveredSynthesis.summary,
               structuredData: {
+                taskClass: TaskClass.ResearchBrowser,
                 currentUrl:
                   recoveredSynthesis.currentUrl ||
                   String(toolResponse.output?.currentUrl ?? selectedUrl),
                 pageTitle:
                   recoveredSynthesis.pageTitle || String(toolResponse.output?.pageTitle ?? ""),
+                sourceUrls: uniqueStrings(
+                  dedupeSourceEvidence([
+                    ...inheritedSources,
+                    {
+                      title:
+                        recoveredSynthesis.pageTitle ||
+                        String(toolResponse.output?.pageTitle ?? ""),
+                      url:
+                        recoveredSynthesis.currentUrl ||
+                        String(toolResponse.output?.currentUrl ?? selectedUrl),
+                      snippet: `${recoveredSynthesis.summary}\n${recoveredSynthesis.extractedFacts.join(" ")}`,
+                      tier: classifySourceTier(
+                        recoveredSynthesis.currentUrl ||
+                          String(toolResponse.output?.currentUrl ?? selectedUrl)
+                      )
+                    }
+                  ]).map((source) => source.url)
+                ),
+                sources: dedupeSourceEvidence([
+                  ...inheritedSources,
+                  {
+                    title:
+                      recoveredSynthesis.pageTitle ||
+                      String(toolResponse.output?.pageTitle ?? ""),
+                    url:
+                      recoveredSynthesis.currentUrl ||
+                      String(toolResponse.output?.currentUrl ?? selectedUrl),
+                    snippet: `${recoveredSynthesis.summary}\n${recoveredSynthesis.extractedFacts.join(" ")}`,
+                    tier: classifySourceTier(
+                      recoveredSynthesis.currentUrl ||
+                        String(toolResponse.output?.currentUrl ?? selectedUrl)
+                    )
+                  }
+                ]),
+                sourceTiers: dedupeSourceEvidence([
+                  ...inheritedSources,
+                  {
+                    title:
+                      recoveredSynthesis.pageTitle ||
+                      String(toolResponse.output?.pageTitle ?? ""),
+                    url:
+                      recoveredSynthesis.currentUrl ||
+                      String(toolResponse.output?.currentUrl ?? selectedUrl),
+                    snippet: `${recoveredSynthesis.summary}\n${recoveredSynthesis.extractedFacts.join(" ")}`,
+                    tier: classifySourceTier(
+                      recoveredSynthesis.currentUrl ||
+                        String(toolResponse.output?.currentUrl ?? selectedUrl)
+                    )
+                  }
+                ]).map((source) => ({ url: source.url, tier: source.tier })),
                 evidencePoints: recoveredSynthesis.evidencePoints,
                 extractedFacts: recoveredSynthesis.extractedFacts,
+                timelineEvents: buildTimelineEventsFromSources(
+                  [
+                    {
+                      title:
+                        recoveredSynthesis.pageTitle ||
+                        String(toolResponse.output?.pageTitle ?? ""),
+                      snippet: `${recoveredSynthesis.summary}\n${recoveredSynthesis.extractedFacts.join(" ")}`,
+                      url:
+                        recoveredSynthesis.currentUrl ||
+                        String(toolResponse.output?.currentUrl ?? selectedUrl)
+                    }
+                  ],
+                  4
+                ),
                 nextQuestions: recoveredSynthesis.nextQuestions,
                 extractedText: String(toolResponse.output?.extractedText ?? ""),
                 attemptSummaries,
@@ -2511,6 +3969,7 @@ export class BrowserAgent implements StepAgent {
               toolResponse,
               selectedUrl,
               attemptSummaries,
+              inheritedSources,
               ...(bootstrapSearchSummary ? { bootstrapSearchSummary } : {}),
               fallbackReason: `browser_json_recovery_failed: ${getErrorMessage(error)}; ${getErrorMessage(recoveryError)}`
             });
@@ -2521,18 +3980,60 @@ export class BrowserAgent implements StepAgent {
           toolResponse,
           selectedUrl,
           attemptSummaries,
+          inheritedSources,
           ...(bootstrapSearchSummary ? { bootstrapSearchSummary } : {}),
           fallbackReason: `browser_synthesis_failed: ${getErrorMessage(error)}`
         });
       }
     }
 
+    const currentUrl = String(toolResponse.output?.currentUrl ?? selectedUrl);
+    const pageTitle = String(toolResponse.output?.pageTitle ?? "");
+    const extractedText = String(toolResponse.output?.extractedText ?? "");
+    const extractedFacts = extractBrowserFactSnippets(extractedText);
+    const browserSources = dedupeSourceEvidence([
+      ...inheritedSources,
+      ...(currentUrl
+        ? [
+            {
+              title: pageTitle || "Browser extract",
+              url: currentUrl,
+              snippet: extractedText,
+              tier: classifySourceTier(currentUrl)
+            }
+          ]
+        : [])
+    ]);
+
     return {
       status: toolResponse.status === "success" ? "success" : "failed",
       summary: `Browser extraction complete using ${this.modelRouter.get("browser").model}`,
       structuredData: {
-        extractedText: String(toolResponse.output?.extractedText ?? ""),
-        currentUrl: String(toolResponse.output?.currentUrl ?? selectedUrl),
+        taskClass: TaskClass.ResearchBrowser,
+        extractedText,
+        currentUrl,
+        sourceUrls: uniqueStrings(browserSources.map((source) => source.url)),
+        sources: browserSources,
+        sourceTiers: browserSources.map((source) => ({ url: source.url, tier: source.tier })),
+        evidencePoints: uniqueStrings(
+          [
+            pageTitle ? `页面标题：${pageTitle}` : "",
+            extractedFacts[0] ? `关键信息：${extractedFacts[0]}` : "",
+            currentUrl ? `来源页面：${currentUrl}` : ""
+          ].filter(Boolean)
+        ),
+        extractedFacts,
+        timelineEvents: buildTimelineEventsFromSources(
+          [
+            {
+              title: pageTitle,
+              snippet: extractedText,
+              url: currentUrl
+            }
+          ],
+          4
+        ),
+        pageTitle,
         attemptSummaries,
         ...(bootstrapSearchSummary ? { bootstrapSearchSummary } : {})
       },
@@ -2556,28 +4057,28 @@ export class DocumentAgent implements StepAgent {
     const previousSummaries = Array.isArray(input.context["previousStepSummaries"])
       ? input.context["previousStepSummaries"].map(String)
       : [];
-    const fallbackBody = [
-      `Model: ${this.modelRouter.get("document").model}`,
-      "",
-      "## Key Findings",
-      ...previousSummaries.map((summary) => `- ${summary}`)
-    ].join("\n");
-    let title = input.goal;
-    let body = fallbackBody;
+    const stepContext = asJsonObject(input.context["currentStep"]);
+    const deterministicFallback = buildDocumentFallbackDraft(input);
+    let title = deterministicFallback.title;
+    let body = deterministicFallback.markdownBody;
     let summary = "Document artifact generated";
-    let keySections: string[] = ["Key Findings"];
+    let keySections: string[] = deterministicFallback.keySections;
+    let usedSources = deterministicFallback.usedSources;
     let llmFallbackReason:
       | { summary: string; category: string; rawReason: string }
       | undefined;
 
     if (canUseLiveLlm(this.mode, this.llmClient)) {
+      const documentPayload: JsonObject = {
+        goal: input.goal,
+        previousStepSummaries: previousSummaries,
+        previousStepEvidence: Array.isArray(input.context["previousStepEvidence"])
+          ? input.context["previousStepEvidence"]
+          : [],
+        context: input.context
+      };
       try {
-        const draft = await this.llmClient.generateJson<{
-          summary: string;
-          title: string;
-          markdownBody: string;
-          keySections: string[];
-        }>({
+        const draft = await this.llmClient.generateJson<DocumentDraft>({
           stage: "document",
           messages: [
             {
@@ -2586,33 +4087,42 @@ export class DocumentAgent implements StepAgent {
             },
             {
               role: "user",
-              content: JSON.stringify(
-                {
-                  goal: input.goal,
-                  previousStepSummaries: previousSummaries,
-                  context: input.context
-                },
-                null,
-                2
-              )
+              content: JSON.stringify(documentPayload, null, 2)
             }
           ],
           jsonSchema: {
             name: "document_draft",
             schema: DOCUMENT_DRAFT_SCHEMA
           },
-          maxOutputTokens: 1_800
+          maxOutputTokens: 2_200,
+          timeoutMs: this.modelRouter.getRequestTimeoutMs("document", TaskClass.DocumentExport)
         });
+        const normalizedDraft = validateDocumentDraft(draft.data as unknown);
 
-        title = draft.data.title || title;
-        body = draft.data.markdownBody || body;
-        summary = draft.data.summary || summary;
-        keySections = draft.data.keySections.length > 0 ? draft.data.keySections : keySections;
+        title = normalizedDraft.title || title;
+        body = normalizedDraft.markdownBody || body;
+        summary = normalizedDraft.summary || summary;
+        keySections = normalizedDraft.keySections.length > 0 ? normalizedDraft.keySections : keySections;
+        usedSources = normalizedDraft.usedSources.length > 0 ? normalizedDraft.usedSources : usedSources;
       } catch (error) {
-        if (shouldFallbackToLocalDraft(error)) {
+        if (isParseOrSchemaError(error)) {
+          try {
+            const recoveredDraft = await recoverDocumentDraft(this.llmClient, documentPayload, error);
+            title = recoveredDraft.title || title;
+            body = recoveredDraft.markdownBody || body;
+            summary = recoveredDraft.summary || summary;
+            keySections =
+              recoveredDraft.keySections.length > 0 ? recoveredDraft.keySections : keySections;
+            usedSources =
+              recoveredDraft.usedSources.length > 0 ? recoveredDraft.usedSources : usedSources;
+          } catch (recoveryError) {
+            llmFallbackReason = summarizeLlmFallbackReason(recoveryError, "document");
+            summary = llmFallbackReason.summary;
+          }
+        } else if (shouldFallbackToLocalDraft(error)) {
           llmFallbackReason = summarizeLlmFallbackReason(error, "document");
           summary = llmFallbackReason.summary;
-          keySections = ["Key Findings", "Fallback Notes"];
+          keySections = deterministicFallback.keySections;
         } else {
           return buildLiveSynthesisFailure("document", error, {
             title,
@@ -2656,14 +4166,41 @@ export class DocumentAgent implements StepAgent {
       callerAgent: this.kind
     });
 
+    const artifactPaths = Array.isArray(toolResponse.artifacts)
+      ? toolResponse.artifacts.map(String)
+      : [];
+    const artifactEvidence = await collectGeneratedArtifactEvidence(artifactPaths);
+    const reportPreview =
+      typeof artifactEvidence.reportPreview === "string"
+        ? artifactEvidence.reportPreview
+        : buildTextPreview(body, 4_000);
+    const normalizedKeySections =
+      Array.isArray(artifactEvidence.keySections) && artifactEvidence.keySections.length > 0
+        ? artifactEvidence.keySections
+        : keySections;
+    const artifactValidation = buildArtifactValidation(
+      artifactPaths,
+      reportPreview,
+      normalizedKeySections
+    );
+
     return {
       status: toolResponse.status === "success" ? "success" : "failed",
       summary,
       structuredData: {
+        taskClass: TaskClass.DocumentExport,
+        qualityProfile: asJsonObject(stepContext["qualityProfile"]),
         title,
         reportBodyLength: body.length,
-        keySections,
-        reportPreview: buildTextPreview(body, 4_000),
+        keySections: normalizedKeySections,
+        reportPreview,
+        usedSources,
+        sectionCoverage: normalizedKeySections.reduce<Record<string, boolean>>((acc, section) => {
+          acc[section] = body.includes(section);
+          return acc;
+        }, {}),
+        artifactValidation,
+        ...artifactEvidence,
         ...(llmFallbackReason
           ? {
               llmFallbackUsed: true,
@@ -2690,6 +4227,7 @@ export class CodingAgent implements StepAgent {
 
   async execute(input: AgentRequest): Promise<AgentResponse> {
     let draft = buildMockCodingDraft(input);
+    const stepContext = asJsonObject(input.context["currentStep"]);
     let llmFallbackReason:
       | { summary: string; category: string; rawReason: string }
       | undefined;
@@ -2720,17 +4258,19 @@ export class CodingAgent implements StepAgent {
             name: "coding_draft",
             schema: CODING_DRAFT_SCHEMA
           },
-          maxOutputTokens: 2_400
+          maxOutputTokens: 2_400,
+          timeoutMs: this.modelRouter.getRequestTimeoutMs("coding", TaskClass.CodingPython)
         });
+        const normalizedDraft = validateCodingDraft(response.data as unknown);
 
-        if (response.data.pythonCode.trim()) {
+        if (normalizedDraft.pythonCode.trim()) {
           draft = {
-            summary: response.data.summary || draft.summary,
-            filename: response.data.filename || draft.filename,
-            pythonCode: response.data.pythonCode,
+            summary: normalizedDraft.summary || draft.summary,
+            filename: normalizedDraft.filename || draft.filename,
+            pythonCode: normalizedDraft.pythonCode,
             expectedArtifacts:
-              response.data.expectedArtifacts.length > 0
-                ? response.data.expectedArtifacts
+              normalizedDraft.expectedArtifacts.length > 0
+                ? normalizedDraft.expectedArtifacts
                 : draft.expectedArtifacts
           };
         }
@@ -2823,27 +4363,92 @@ export class CodingAgent implements StepAgent {
       callerAgent: this.kind
     });
 
-    const generatedFiles = Array.isArray(toolResponse.output?.generatedFiles)
-      ? toolResponse.output.generatedFiles.map(String)
+    let effectiveToolResponse = toolResponse;
+    let effectiveDraft = draft;
+    if (
+      toolResponse.status === "failed" &&
+      isPythonSyntaxFailure(toolResponse) &&
+      !llmFallbackReason
+    ) {
+      effectiveDraft = buildDeterministicCodingFallback(input);
+      llmFallbackReason = {
+        summary:
+          effectiveDraft.fallbackKind === "pdf"
+            ? "LLM 生成脚本存在语法问题，已切换到本地 PDF fallback"
+            : "LLM 生成脚本存在语法问题，已切换到本地 Python fallback",
+        category: "syntax_invalid",
+        rawReason: toolResponse.error?.message ?? toolResponse.summary
+      };
+      effectiveDraft.summary = llmFallbackReason.summary;
+      effectiveToolResponse = await this.toolRuntime.execute({
+        taskId: input.taskId,
+        stepId: input.stepId ?? "unknown-step",
+        toolName: ToolName.Python,
+        action: "run_script",
+        inputFiles: uploadedArtifactUris,
+        input: {
+          filename: effectiveDraft.filename,
+          code: effectiveDraft.pythonCode,
+          ...(uploadedArtifactUris.length > 0 ? { inputFiles: uploadedArtifactUris } : {})
+        },
+        callerAgent: this.kind
+      });
+    }
+
+    const generatedFiles = Array.isArray(effectiveToolResponse.output?.generatedFiles)
+      ? effectiveToolResponse.output.generatedFiles.map(String)
       : [];
     const generatedEvidence =
-      toolResponse.status === "success"
+      effectiveToolResponse.status === "success"
         ? await collectGeneratedArtifactEvidence(generatedFiles)
         : {};
+    const artifactPaths = Array.isArray(effectiveToolResponse.artifacts)
+      ? effectiveToolResponse.artifacts.map(String)
+      : [];
+    const artifactValidation = buildArtifactValidation(
+      [...generatedFiles, ...artifactPaths],
+      typeof generatedEvidence.reportPreview === "string" ? generatedEvidence.reportPreview : undefined,
+      Array.isArray(generatedEvidence.keySections) ? generatedEvidence.keySections : []
+    );
+    const outputSchemas = uniqueStrings(
+      generatedFiles.map((filePath) => {
+        const lower = filePath.toLowerCase();
+        if (lower.endsWith(".json")) {
+          return "json";
+        }
+        if (lower.endsWith(".md")) {
+          return "markdown";
+        }
+        if (lower.endsWith(".csv")) {
+          return "csv";
+        }
+        if (lower.endsWith(".pdf")) {
+          return "pdf";
+        }
+        return path.extname(lower).replace(/^\./, "") || "file";
+      })
+    );
 
     return {
-      status: toolResponse.status === "success" ? "success" : "failed",
-      summary: toolResponse.status === "success" ? draft.summary : toolResponse.summary,
+      status: effectiveToolResponse.status === "success" ? "success" : "failed",
+      summary:
+        effectiveToolResponse.status === "success"
+          ? effectiveDraft.summary
+          : effectiveToolResponse.summary,
       structuredData: {
-        filename: draft.filename,
-        expectedArtifacts: draft.expectedArtifacts,
-        stdout: String(toolResponse.output?.stdout ?? ""),
-        stderr: String(toolResponse.output?.stderr ?? ""),
+        taskClass: TaskClass.CodingPython,
+        qualityProfile: asJsonObject(stepContext["qualityProfile"]),
+        filename: effectiveDraft.filename,
+        expectedArtifacts: effectiveDraft.expectedArtifacts,
+        stdout: String(effectiveToolResponse.output?.stdout ?? ""),
+        stderr: String(effectiveToolResponse.output?.stderr ?? ""),
         generatedFiles,
-        scriptPath: String(toolResponse.output?.scriptPath ?? ""),
-        inputFiles: Array.isArray(toolResponse.output?.inputFiles)
-          ? toolResponse.output?.inputFiles
+        scriptPath: String(effectiveToolResponse.output?.scriptPath ?? ""),
+        inputFiles: Array.isArray(effectiveToolResponse.output?.inputFiles)
+          ? effectiveToolResponse.output?.inputFiles
           : uploadedArtifactUris,
+        outputSchemas,
+        artifactValidation,
         ...generatedEvidence,
         ...(llmFallbackReason
           ? {
@@ -2853,8 +4458,8 @@ export class CodingAgent implements StepAgent {
             }
           : {})
       },
-      ...(toolResponse.artifacts ? { artifacts: toolResponse.artifacts } : {}),
-      ...(toolResponse.error ? { error: toolResponse.error } : {})
+      ...(effectiveToolResponse.artifacts ? { artifacts: effectiveToolResponse.artifacts } : {}),
+      ...(effectiveToolResponse.error ? { error: effectiveToolResponse.error } : {})
     };
   }
 }
@@ -2873,18 +4478,56 @@ export class ActionAgent implements StepAgent {
     const isApproved =
       approvalStatus === ApprovalStatus.Approved || approvalStatus === ApprovalStatus.Executed;
     const previousStepSummaries = asStringArray(input.context["previousStepSummaries"]);
+    const goalAndContext = [input.goal, JSON.stringify(input.context)].join("\n").toLowerCase();
+    const actionType =
+      asOptionalString(input.context["actionType"]) ??
+      (EMAIL_KEYWORDS.some((keyword) => goalAndContext.includes(keyword))
+        ? "send_email"
+        : SLACK_KEYWORDS.some((keyword) => goalAndContext.includes(keyword))
+          ? "send_slack"
+          : NOTION_KEYWORDS.some((keyword) => goalAndContext.includes(keyword))
+            ? "create_notion_page"
+            : "send_webhook");
     const url =
       asOptionalString(input.context["actionUrl"]) ??
-      process.env.OPENCLAW_ACTION_WEBHOOK_URL ??
+      (actionType === "send_slack"
+        ? process.env.OPENCLAW_SLACK_WEBHOOK_URL
+        : process.env.OPENCLAW_ACTION_WEBHOOK_URL) ??
       (this.mode === "mock" ? "https://example.com/webhook" : "");
+    const emailTo = asOptionalString(input.context["emailTo"]);
+    const notionParentPageId = asOptionalString(input.context["notionParentPageId"]);
 
-    if (!url) {
+    if (actionType === "send_webhook" && !url) {
       return {
         status: "failed",
         summary: "Action agent is missing a webhook url",
         error: {
           code: ErrorCode.InvalidInput,
           message: "Set OPENCLAW_ACTION_WEBHOOK_URL or provide actionUrl in step context",
+          retryable: false
+        }
+      };
+    }
+
+    if (actionType === "send_email" && !emailTo) {
+      return {
+        status: "failed",
+        summary: "Action agent is missing an email recipient",
+        error: {
+          code: ErrorCode.InvalidInput,
+          message: "Provide emailTo in step context for email delivery",
+          retryable: false
+        }
+      };
+    }
+
+    if (actionType === "create_notion_page" && !notionParentPageId && !process.env.OPENCLAW_NOTION_PARENT_PAGE_ID) {
+      return {
+        status: "failed",
+        summary: "Action agent is missing a Notion parent page id",
+        error: {
+          code: ErrorCode.InvalidInput,
+          message: "Provide notionParentPageId in step context or set OPENCLAW_NOTION_PARENT_PAGE_ID",
           retryable: false
         }
       };
@@ -2900,21 +4543,84 @@ export class ActionAgent implements StepAgent {
           : `Task completed for goal: ${input.goal}`,
       context: asJsonObject(input.context)
     };
+    const resolvedNotionParentPageId =
+      notionParentPageId ?? process.env.OPENCLAW_NOTION_PARENT_PAGE_ID;
 
     if (!isApproved) {
+      let approvalPayload: JsonObject;
+      if (actionType === "send_email") {
+        approvalPayload = {
+          ...(emailTo ? { to: emailTo } : {}),
+          subject: asOptionalString(input.context["emailSubject"]) ?? `Task ${input.taskId} update`,
+          text: String(payload.message)
+        };
+      } else if (actionType === "send_slack") {
+        approvalPayload = {
+          url,
+          text: String(payload.message)
+        };
+      } else if (actionType === "create_notion_page") {
+        approvalPayload = {
+          title: asOptionalString(input.context["notionTitle"]) ?? `Task ${input.taskId}`,
+          body: String(payload.message)
+        };
+        if (resolvedNotionParentPageId) {
+          approvalPayload.parentPageId = resolvedNotionParentPageId;
+        }
+      } else {
+        approvalPayload = {
+          url,
+          method: "POST",
+          payload
+        };
+      }
+
       return {
         status: "need_approval",
-        summary: `Action step requires approval before posting to ${url}`,
+        summary:
+          actionType === "send_email"
+            ? `Action step requires approval before sending email to ${emailTo}`
+            : actionType === "send_slack"
+              ? "Action step requires approval before posting to Slack"
+              : actionType === "create_notion_page"
+                ? "Action step requires approval before creating a Notion page"
+                : `Action step requires approval before posting to ${url}`,
         structuredData: {
+          taskClass: TaskClass.ActionExecution,
+          approvalStatus: ApprovalStatus.Pending,
           toolName: ToolName.Action,
-          action: "post_webhook",
-          approvalReason: "This step sends an external webhook and has side effects.",
-          approvalPayload: {
-            url,
-            method: "POST",
-            payload
-          }
+          action: actionType,
+          approvalReason: "This step performs an external side effect and requires approval.",
+          approvalPayload
         }
+      };
+    }
+
+    let actionInput: JsonObject;
+    if (actionType === "send_email") {
+      actionInput = {
+        ...(emailTo ? { to: emailTo } : {}),
+        subject: asOptionalString(input.context["emailSubject"]) ?? `Task ${input.taskId} update`,
+        text: String(payload.message)
+      };
+    } else if (actionType === "send_slack") {
+      actionInput = {
+        url,
+        text: String(payload.message)
+      };
+    } else if (actionType === "create_notion_page") {
+      actionInput = {
+        title: asOptionalString(input.context["notionTitle"]) ?? `Task ${input.taskId}`,
+        body: String(payload.message)
+      };
+      if (resolvedNotionParentPageId) {
+        actionInput.parentPageId = resolvedNotionParentPageId;
+      }
+    } else {
+      actionInput = {
+        url,
+        method: "POST",
+        payload
       };
     }
 
@@ -2922,12 +4628,8 @@ export class ActionAgent implements StepAgent {
       taskId: input.taskId,
       stepId: input.stepId ?? "unknown-step",
       toolName: ToolName.Action,
-      action: "post_webhook",
-      input: {
-        url,
-        method: "POST",
-        payload
-      },
+      action: actionType,
+      input: actionInput,
       callerAgent: this.kind
     });
 
@@ -2935,9 +4637,15 @@ export class ActionAgent implements StepAgent {
       status: toolResponse.status === "success" ? "success" : "failed",
       summary: toolResponse.status === "success" ? "Action execution complete" : toolResponse.summary,
       structuredData: {
-        url,
+        taskClass: TaskClass.ActionExecution,
+        approvalStatus: isApproved ? ApprovalStatus.Executed : ApprovalStatus.Pending,
+        actionType,
+        ...(url ? { url } : {}),
+        ...(emailTo ? { emailTo } : {}),
+        ...(notionParentPageId ? { notionParentPageId } : {}),
         deliveryStatus: toolResponse.status,
-        response: toolResponse.output ?? {}
+        response: toolResponse.output ?? {},
+        deliveryReceipt: toolResponse.output ?? {}
       },
       ...(toolResponse.error ? { error: toolResponse.error } : {})
     };
@@ -2956,8 +4664,14 @@ export class VerifierAgent implements VerifyingAgent {
     step: TaskStep,
     response: AgentResponse
   ): Promise<VerificationDecision> {
+    const baseline = normalizeVerificationDecision(
+      step,
+      response,
+      this.mockVerify(task, step, response)
+    );
+
     if (response.status !== "success") {
-      return this.mockVerify(step, response);
+      return baseline;
     }
 
     if (this.mode === "live" && this.llmClient?.isConfigured()) {
@@ -2986,7 +4700,8 @@ export class VerifierAgent implements VerifyingAgent {
                     summary: response.summary,
                     artifacts: response.artifacts ?? [],
                     structuredData: response.structuredData ?? {},
-                    error: response.error ?? null
+                    error: response.error ?? null,
+                    baselineVerification: baseline
                   }
                 },
                 null,
@@ -2998,49 +4713,27 @@ export class VerifierAgent implements VerifyingAgent {
             name: "verification_decision",
             schema: VERIFICATION_SCHEMA
           },
-          maxOutputTokens: 800
+          maxOutputTokens: 1_000,
+          timeoutMs: this.modelRouter.getRequestTimeoutMs(
+            "verifier_step",
+            getStepTaskClass(task, step)
+          )
         });
-        return normalizeVerificationDecision(step, response, llmDecision.data);
+        return normalizeVerificationDecision(
+          step,
+          response,
+          mergeVerificationDecision(baseline, llmDecision.data)
+        );
       } catch {
-        return normalizeVerificationDecision(step, response, this.mockVerify(step, response));
+        return baseline;
       }
     }
 
-    return normalizeVerificationDecision(step, response, this.mockVerify(step, response));
+    return baseline;
   }
 
-  private mockVerify(step: TaskStep, response: AgentResponse): VerificationDecision {
-    if (response.status !== "success") {
-      const detailedReason = response.error?.message?.trim();
-      return {
-        verdict: response.error?.retryable ? "retry_step" : "replan_task",
-        reason:
-          detailedReason && detailedReason.length > 0
-            ? detailedReason
-            : `Step failed under ${this.modelRouter.get("verifier_step").model}`,
-        missingCriteria: step.successCriteria,
-        suggestedFix: "Inspect tool output or retry with stronger strategy",
-        confidence: 0.75
-      };
-    }
-
-    if (step.agent === AgentKind.Document && (!response.artifacts || response.artifacts.length === 0)) {
-      return {
-        verdict: "retry_step",
-        reason: "Document step completed without an artifact",
-        missingCriteria: ["A markdown artifact exists"],
-        suggestedFix: "Re-run document generation",
-        confidence: 0.9
-      };
-    }
-
-    return {
-      verdict: "pass",
-      reason: `Step verified using ${this.modelRouter.get("verifier_step").model}`,
-      missingCriteria: [],
-      suggestedFix: "",
-      confidence: 0.92
-    };
+  private mockVerify(task: Task, step: TaskStep, response: AgentResponse): VerificationDecision {
+    return calculateQualityAssessment(task, step, response);
   }
 }
 

@@ -4,7 +4,13 @@ import {
   ApprovalRequest,
   ApprovalRequestRepository,
   Artifact,
+  ArtifactIndexEntry,
+  ArtifactIndexRepository,
   ArtifactRepository,
+  BenchmarkRun,
+  BenchmarkRunItem,
+  BenchmarkRunItemRepository,
+  BenchmarkRunRepository,
   Checkpoint,
   CheckpointRepository,
   MemoryRecord,
@@ -16,25 +22,42 @@ import {
   TaskJobRepository,
   TaskError,
   TaskOrigin,
+  TaskReference,
+  TaskReferenceRepository,
   TaskRepository,
+  TaskSummary,
+  TaskSummaryRepository,
   TaskStep,
+  TaskClass,
   TaskJobStatus,
   ToolCall,
   ToolCallRepository,
   UserProfile,
   UserProfileRepository
 } from "../../core/src";
+import { DeliveryKind } from "../../core/src";
 import { JsonObject } from "../../shared/src";
 
 const DEFAULT_DATABASE_URL = `file:${path.resolve(process.cwd(), ".data", "openclaw-manus.db")}`;
 
 const serializeJson = (value: unknown): string => JSON.stringify(value ?? null);
 
+const parseJsonValue = <T>(value: string | null | undefined, fallback: T): T => {
+  if (!value) {
+    return fallback;
+  }
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    return fallback;
+  }
+};
+
 const parseJsonObject = (value: string | null | undefined): JsonObject =>
-  value ? (JSON.parse(value) as JsonObject) : {};
+  parseJsonValue<JsonObject>(value, {});
 
 const parseStringArray = (value: string | null | undefined): string[] =>
-  value ? (JSON.parse(value) as string[]) : [];
+  parseJsonValue<string[]>(value, []);
 
 const parseTaskError = (value: string | null | undefined): TaskError | undefined =>
   value ? (JSON.parse(value) as TaskError) : undefined;
@@ -57,6 +80,104 @@ const parseTaskOrigin = (value: string | null | undefined): TaskOrigin | undefin
 
 const parseString = (value: string | null | undefined): string | undefined =>
   typeof value === "string" && value.length > 0 ? value : undefined;
+
+const mapStepRecordToTaskStep = (stepRecord: {
+  stepId: string;
+  title: string;
+  agent: string;
+  taskClass: string | null;
+  qualityProfileJson: string | null;
+  attemptStrategyJson: string | null;
+  objective: string;
+  dependsOnJson: string;
+  status: string;
+  retryCount: number;
+  successCriteriaJson: string;
+  summary: string | null;
+  inputArtifactsJson: string;
+  outputArtifactsJson: string;
+  structuredDataJson: string;
+  evidencePackageJson: string | null;
+  qualityScore: number | null;
+  qualityDefectsJson: string | null;
+  missingEvidenceJson: string | null;
+  sourceCoverageScore: number | null;
+  formatCompliance: string | null;
+  attemptHistoryJson: string | null;
+  referenceArtifactIdsJson: string | null;
+  errorJson: string | null;
+}): TaskStep => ({
+  id: stepRecord.stepId,
+  title: stepRecord.title,
+  agent: stepRecord.agent as TaskStep["agent"],
+  ...(stepRecord.taskClass ? { taskClass: stepRecord.taskClass as TaskClass } : {}),
+  ...(stepRecord.qualityProfileJson
+    ? { qualityProfile: parseJsonValue(stepRecord.qualityProfileJson, {}) }
+    : {}),
+  ...(stepRecord.attemptStrategyJson
+    ? { attemptStrategy: parseJsonValue(stepRecord.attemptStrategyJson, {}) }
+    : {}),
+  objective: stepRecord.objective,
+  dependsOn: parseStringArray(stepRecord.dependsOnJson),
+  status: stepRecord.status as TaskStep["status"],
+  retryCount: stepRecord.retryCount,
+  successCriteria: parseStringArray(stepRecord.successCriteriaJson),
+  ...(stepRecord.summary ? { summary: stepRecord.summary } : {}),
+  inputArtifacts: parseStringArray(stepRecord.inputArtifactsJson),
+  outputArtifacts: parseStringArray(stepRecord.outputArtifactsJson),
+  structuredData: parseJsonObject(stepRecord.structuredDataJson),
+  ...(stepRecord.evidencePackageJson
+    ? { evidencePackage: parseJsonObject(stepRecord.evidencePackageJson) }
+    : {}),
+  ...(typeof stepRecord.qualityScore === "number"
+    ? { qualityScore: stepRecord.qualityScore }
+    : {}),
+  ...(stepRecord.qualityDefectsJson
+    ? { qualityDefects: parseStringArray(stepRecord.qualityDefectsJson) }
+    : {}),
+  ...(stepRecord.missingEvidenceJson
+    ? { missingEvidence: parseStringArray(stepRecord.missingEvidenceJson) }
+    : {}),
+  ...(typeof stepRecord.sourceCoverageScore === "number"
+    ? { sourceCoverageScore: stepRecord.sourceCoverageScore }
+    : {}),
+  ...(stepRecord.formatCompliance ? { formatCompliance: stepRecord.formatCompliance } : {}),
+  ...(stepRecord.attemptHistoryJson
+    ? { attemptHistory: parseJsonValue<JsonObject[]>(stepRecord.attemptHistoryJson, []) }
+    : {}),
+  ...(stepRecord.referenceArtifactIdsJson
+    ? { referenceArtifactIds: parseStringArray(stepRecord.referenceArtifactIdsJson) }
+    : {}),
+  ...(stepRecord.errorJson ? { error: parseTaskError(stepRecord.errorJson)! } : {})
+});
+
+const mapArtifactRecordToArtifact = (record: {
+  id: string;
+  taskId: string;
+  stepId: string | null;
+  type: string;
+  uri: string;
+  title: string | null;
+  summary: string | null;
+  keywordsJson: string | null;
+  validated: boolean | null;
+  deliveryKind: string | null;
+  metadataJson: string;
+  createdAt: Date;
+}): Artifact => ({
+  id: record.id,
+  taskId: record.taskId,
+  type: record.type as Artifact["type"],
+  uri: record.uri,
+  ...(record.title ? { title: record.title } : {}),
+  ...(record.summary ? { summary: record.summary } : {}),
+  ...(record.keywordsJson ? { keywords: parseStringArray(record.keywordsJson) } : {}),
+  ...(typeof record.validated === "boolean" ? { validated: record.validated } : {}),
+  ...(record.deliveryKind ? { deliveryKind: record.deliveryKind as DeliveryKind } : {}),
+  metadata: parseJsonObject(record.metadataJson),
+  createdAt: record.createdAt.toISOString(),
+  ...(record.stepId ? { stepId: record.stepId } : {})
+});
 
 const subtractMs = (isoValue: string, durationMs: number): string =>
   new Date(new Date(isoValue).getTime() - durationMs).toISOString();
@@ -280,6 +401,10 @@ export class InMemoryTaskJobRepository implements TaskJobRepository {
       ...structuredClone(next),
       status: TaskJobStatus.Running,
       attempts: next.attempts + 1,
+      payload: {
+        ...next.payload,
+        reclaimedFromStaleLease: next.status === TaskJobStatus.Running
+      },
       lockedAt: now,
       lockedBy: workerId,
       updatedAt: now
@@ -394,26 +519,15 @@ export class PrismaTaskRepository implements TaskRepository {
 
     const plan = JSON.parse(taskRecord.planJson) as Task["plan"];
     const origin = parseTaskOrigin(taskRecord.originJson);
-    const steps: TaskStep[] = taskRecord.steps.map((stepRecord) => ({
-      id: stepRecord.stepId,
-      title: stepRecord.title,
-      agent: stepRecord.agent as TaskStep["agent"],
-      objective: stepRecord.objective,
-      dependsOn: parseStringArray(stepRecord.dependsOnJson),
-      status: stepRecord.status as TaskStep["status"],
-      retryCount: stepRecord.retryCount,
-      successCriteria: parseStringArray(stepRecord.successCriteriaJson),
-      ...(stepRecord.summary ? { summary: stepRecord.summary } : {}),
-      inputArtifacts: parseStringArray(stepRecord.inputArtifactsJson),
-      outputArtifacts: parseStringArray(stepRecord.outputArtifactsJson),
-      structuredData: parseJsonObject(stepRecord.structuredDataJson),
-      ...(stepRecord.errorJson ? { error: parseTaskError(stepRecord.errorJson)! } : {})
-    }));
+    const steps: TaskStep[] = taskRecord.steps.map((stepRecord) =>
+      mapStepRecordToTaskStep(stepRecord)
+    );
 
     return {
       id: taskRecord.id,
       userId: taskRecord.userId,
       goal: taskRecord.goal,
+      ...(taskRecord.recipeId ? { recipeId: taskRecord.recipeId } : {}),
       status: taskRecord.status as Task["status"],
       createdAt: taskRecord.createdAt.toISOString(),
       updatedAt: taskRecord.updatedAt.toISOString(),
@@ -422,6 +536,14 @@ export class PrismaTaskRepository implements TaskRepository {
       steps,
       ...(origin ? { origin } : {}),
       ...(taskRecord.finalArtifactUri ? { finalArtifactUri: taskRecord.finalArtifactUri } : {}),
+      ...(taskRecord.finalArtifactValidationJson
+        ? {
+            finalArtifactValidation: parseJsonValue(
+              taskRecord.finalArtifactValidationJson,
+              { validated: false, issues: [] }
+            )
+          }
+        : {}),
       ...(taskRecord.retryOfTaskId ? { retryOfTaskId: taskRecord.retryOfTaskId } : {}),
       ...(taskRecord.cancelRequestedAt
         ? { cancelRequestedAt: taskRecord.cancelRequestedAt.toISOString() }
@@ -455,6 +577,7 @@ export class PrismaTaskRepository implements TaskRepository {
         update: {
           userId: task.userId,
           goal: task.goal,
+          recipeId: task.recipeId ?? null,
           status: task.status,
           createdAt: toDate(task.createdAt),
           updatedAt: toDate(task.updatedAt),
@@ -462,6 +585,9 @@ export class PrismaTaskRepository implements TaskRepository {
           planJson: serializeJson(task.plan),
           originJson: task.origin ? serializeJson(task.origin) : null,
           finalArtifactUri: task.finalArtifactUri ?? null,
+          finalArtifactValidationJson: task.finalArtifactValidation
+            ? serializeJson(task.finalArtifactValidation)
+            : null,
           retryOfTaskId: task.retryOfTaskId ?? null,
           cancelRequestedAt: task.cancelRequestedAt ? toDate(task.cancelRequestedAt) : null
         },
@@ -469,6 +595,7 @@ export class PrismaTaskRepository implements TaskRepository {
           id: task.id,
           userId: task.userId,
           goal: task.goal,
+          recipeId: task.recipeId ?? null,
           status: task.status,
           createdAt: toDate(task.createdAt),
           updatedAt: toDate(task.updatedAt),
@@ -476,6 +603,9 @@ export class PrismaTaskRepository implements TaskRepository {
           planJson: serializeJson(task.plan),
           originJson: task.origin ? serializeJson(task.origin) : null,
           finalArtifactUri: task.finalArtifactUri ?? null,
+          finalArtifactValidationJson: task.finalArtifactValidation
+            ? serializeJson(task.finalArtifactValidation)
+            : null,
           retryOfTaskId: task.retryOfTaskId ?? null,
           cancelRequestedAt: task.cancelRequestedAt ? toDate(task.cancelRequestedAt) : null
         }
@@ -494,6 +624,9 @@ export class PrismaTaskRepository implements TaskRepository {
             orderIndex: index,
             title: step.title,
             agent: step.agent,
+            taskClass: step.taskClass ?? null,
+            qualityProfileJson: step.qualityProfile ? serializeJson(step.qualityProfile) : null,
+            attemptStrategyJson: step.attemptStrategy ? serializeJson(step.attemptStrategy) : null,
             objective: step.objective,
             dependsOnJson: serializeJson(step.dependsOn),
             status: step.status,
@@ -503,6 +636,17 @@ export class PrismaTaskRepository implements TaskRepository {
             inputArtifactsJson: serializeJson(step.inputArtifacts),
             outputArtifactsJson: serializeJson(step.outputArtifacts),
             structuredDataJson: serializeJson(step.structuredData),
+            evidencePackageJson: step.evidencePackage ? serializeJson(step.evidencePackage) : null,
+            qualityScore: typeof step.qualityScore === "number" ? step.qualityScore : null,
+            qualityDefectsJson: step.qualityDefects ? serializeJson(step.qualityDefects) : null,
+            missingEvidenceJson: step.missingEvidence ? serializeJson(step.missingEvidence) : null,
+            sourceCoverageScore:
+              typeof step.sourceCoverageScore === "number" ? step.sourceCoverageScore : null,
+            formatCompliance: step.formatCompliance ?? null,
+            attemptHistoryJson: step.attemptHistory ? serializeJson(step.attemptHistory) : null,
+            referenceArtifactIdsJson: step.referenceArtifactIds
+              ? serializeJson(step.referenceArtifactIds)
+              : null,
             errorJson: step.error ? serializeJson(step.error) : null
           }))
         });
@@ -644,20 +788,17 @@ export class PrismaArtifactRepository implements ArtifactRepository {
         stepId: artifact.stepId ?? null,
         type: artifact.type,
         uri: artifact.uri,
+        title: artifact.title ?? null,
+        summary: artifact.summary ?? null,
+        keywordsJson: artifact.keywords ? serializeJson(artifact.keywords) : null,
+        validated: typeof artifact.validated === "boolean" ? artifact.validated : null,
+        deliveryKind: artifact.deliveryKind ?? null,
         metadataJson: serializeJson(artifact.metadata),
         createdAt: toDate(artifact.createdAt)
       }
     });
 
-    return {
-      id: record.id,
-      taskId: record.taskId,
-      type: record.type as Artifact["type"],
-      uri: record.uri,
-      metadata: parseJsonObject(record.metadataJson),
-      createdAt: record.createdAt.toISOString(),
-      ...(record.stepId ? { stepId: record.stepId } : {})
-    };
+    return mapArtifactRecordToArtifact(record);
   }
 
   async listByTask(taskId: string): Promise<Artifact[]> {
@@ -667,15 +808,7 @@ export class PrismaArtifactRepository implements ArtifactRepository {
       orderBy: { createdAt: "asc" }
     });
 
-    return records.map((record) => ({
-      id: record.id,
-      taskId: record.taskId,
-      type: record.type as Artifact["type"],
-      uri: record.uri,
-      metadata: parseJsonObject(record.metadataJson),
-      createdAt: record.createdAt.toISOString(),
-      ...(record.stepId ? { stepId: record.stepId } : {})
-    }));
+    return records.map((record) => mapArtifactRecordToArtifact(record));
   }
 }
 
@@ -1124,6 +1257,7 @@ export class PrismaTaskJobRepository implements TaskJobRepository {
       data: {
         status?: string;
         attempts?: number;
+        payloadJson?: string;
         availableAt?: Date;
         updatedAt: Date;
         lockedAt?: Date | null;
@@ -1155,6 +1289,7 @@ export class PrismaTaskJobRepository implements TaskJobRepository {
       data: {
         status?: string;
         attempts?: number;
+        payloadJson?: string;
         availableAt?: Date;
         updatedAt: Date;
         lockedAt?: Date | null;
@@ -1253,6 +1388,12 @@ export class PrismaTaskJobRepository implements TaskJobRepository {
         data: {
           status: "RUNNING",
           attempts: next.attempts + 1,
+          payloadJson: JSON.stringify({
+            ...(typeof next.payloadJson === "string" && next.payloadJson.length > 0
+              ? JSON.parse(next.payloadJson)
+              : {}),
+            reclaimedFromStaleLease: next.status === "RUNNING"
+          }),
           lockedAt: now,
           lockedBy: workerId,
           updatedAt: now
@@ -1402,6 +1543,144 @@ class InMemoryMemoryRepository implements MemoryRepository {
   }
 }
 
+class InMemoryTaskSummaryRepository implements TaskSummaryRepository {
+  private readonly summaries = new Map<string, TaskSummary[]>();
+
+  async save(summary: TaskSummary): Promise<TaskSummary> {
+    const existing = this.summaries.get(summary.taskId) ?? [];
+    const next = existing.filter((candidate) => candidate.id !== summary.id);
+    next.push(structuredClone(summary));
+    this.summaries.set(summary.taskId, next);
+    return structuredClone(summary);
+  }
+
+  async listRecentByUser(userId: string, limit = 20): Promise<TaskSummary[]> {
+    return [...this.summaries.values()]
+      .flat()
+      .filter((summary) => summary.userId === userId)
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+      .slice(0, Math.max(1, limit))
+      .map((summary) => structuredClone(summary));
+  }
+
+  async listByTask(taskId: string): Promise<TaskSummary[]> {
+    return structuredClone(this.summaries.get(taskId) ?? []);
+  }
+}
+
+class InMemoryArtifactIndexRepository implements ArtifactIndexRepository {
+  private readonly entries = new Map<string, ArtifactIndexEntry>();
+
+  async save(entry: ArtifactIndexEntry): Promise<ArtifactIndexEntry> {
+    this.entries.set(entry.id, structuredClone(entry));
+    return structuredClone(entry);
+  }
+
+  async search(query: {
+    q?: string;
+    taskClass?: string;
+    artifactType?: string;
+    validatedOnly?: boolean;
+    limit?: number;
+  }): Promise<ArtifactIndexEntry[]> {
+    const q = String(query.q ?? "").trim().toLowerCase();
+    return [...this.entries.values()]
+      .filter((entry: ArtifactIndexEntry) => {
+        if (query.taskClass && entry.taskClass !== query.taskClass) {
+          return false;
+        }
+        if (query.artifactType && entry.artifactType !== query.artifactType) {
+          return false;
+        }
+        if (query.validatedOnly && entry.validated !== true) {
+          return false;
+        }
+        if (!q) {
+          return true;
+        }
+        const haystack = [
+          entry.title ?? "",
+          entry.summary ?? "",
+          ...entry.keywords,
+          entry.uri
+        ]
+          .join(" ")
+          .toLowerCase();
+        return haystack.includes(q);
+      })
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+      .slice(0, Math.max(1, query.limit ?? 20))
+      .map((entry) => structuredClone(entry));
+  }
+
+  async listByTask(taskId: string): Promise<ArtifactIndexEntry[]> {
+    return [...this.entries.values()]
+      .filter((entry) => entry.taskId === taskId)
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
+      .map((entry) => structuredClone(entry));
+  }
+}
+
+class InMemoryTaskReferenceRepository implements TaskReferenceRepository {
+  private readonly references = new Map<string, TaskReference[]>();
+
+  async save(reference: TaskReference): Promise<TaskReference> {
+    const existing = this.references.get(reference.taskId) ?? [];
+    existing.push(structuredClone(reference));
+    this.references.set(reference.taskId, existing);
+    return structuredClone(reference);
+  }
+
+  async listByTask(taskId: string): Promise<TaskReference[]> {
+    return [...(this.references.get(taskId) ?? [])]
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
+      .map((reference) => structuredClone(reference));
+  }
+}
+
+class InMemoryBenchmarkRunRepository implements BenchmarkRunRepository {
+  private readonly runs = new Map<string, BenchmarkRun>();
+
+  async create(run: BenchmarkRun): Promise<BenchmarkRun> {
+    this.runs.set(run.id, structuredClone(run));
+    return structuredClone(run);
+  }
+
+  async update(run: BenchmarkRun): Promise<BenchmarkRun> {
+    this.runs.set(run.id, structuredClone(run));
+    return structuredClone(run);
+  }
+
+  async getById(runId: string): Promise<BenchmarkRun | undefined> {
+    const run = this.runs.get(runId);
+    return run ? structuredClone(run) : undefined;
+  }
+
+  async listRecent(limit = 20): Promise<BenchmarkRun[]> {
+    return [...this.runs.values()]
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+      .slice(0, Math.max(1, limit))
+      .map((run) => structuredClone(run));
+  }
+}
+
+class InMemoryBenchmarkRunItemRepository implements BenchmarkRunItemRepository {
+  private readonly items = new Map<string, BenchmarkRunItem[]>();
+
+  async create(item: BenchmarkRunItem): Promise<BenchmarkRunItem> {
+    const existing = this.items.get(item.benchmarkRunId) ?? [];
+    existing.push(structuredClone(item));
+    this.items.set(item.benchmarkRunId, existing);
+    return structuredClone(item);
+  }
+
+  async listByRun(benchmarkRunId: string): Promise<BenchmarkRunItem[]> {
+    return [...(this.items.get(benchmarkRunId) ?? [])]
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
+      .map((item) => structuredClone(item));
+  }
+}
+
 class PrismaMemoryRepository implements MemoryRepository {
   constructor(
     private readonly prisma: PrismaClient,
@@ -1438,16 +1717,367 @@ class PrismaMemoryRepository implements MemoryRepository {
   }
 }
 
+class PrismaTaskSummaryRepository implements TaskSummaryRepository {
+  constructor(
+    private readonly prisma: PrismaClient,
+    private readonly bootstrap: PrismaSqliteBootstrap
+  ) {}
+
+  async save(summary: TaskSummary): Promise<TaskSummary> {
+    await this.bootstrap.ensureInitialized();
+    const record = await (this.prisma as any).taskSummaryRecord.upsert({
+      where: { id: summary.id },
+      update: {
+        taskId: summary.taskId,
+        userId: summary.userId,
+        taskClass: summary.taskClass ?? null,
+        recipeId: summary.recipeId ?? null,
+        summary: summary.summary,
+        keywordsJson: serializeJson(summary.keywords),
+        validated: summary.validated,
+        createdAt: toDate(summary.createdAt)
+      },
+      create: {
+        id: summary.id,
+        taskId: summary.taskId,
+        userId: summary.userId,
+        taskClass: summary.taskClass ?? null,
+        recipeId: summary.recipeId ?? null,
+        summary: summary.summary,
+        keywordsJson: serializeJson(summary.keywords),
+        validated: summary.validated,
+        createdAt: toDate(summary.createdAt)
+      }
+    });
+    return this.map(record);
+  }
+
+  async listRecentByUser(userId: string, limit = 20): Promise<TaskSummary[]> {
+    await this.bootstrap.ensureInitialized();
+    const records = await (this.prisma as any).taskSummaryRecord.findMany({
+      where: { userId },
+      orderBy: { createdAt: "desc" },
+      take: Math.max(1, limit)
+    });
+    return records.map((record: any) => this.map(record));
+  }
+
+  async listByTask(taskId: string): Promise<TaskSummary[]> {
+    await this.bootstrap.ensureInitialized();
+    const records = await (this.prisma as any).taskSummaryRecord.findMany({
+      where: { taskId },
+      orderBy: { createdAt: "asc" }
+    });
+    return records.map((record: any) => this.map(record));
+  }
+
+  private map(record: any): TaskSummary {
+    return {
+      id: record.id,
+      taskId: record.taskId,
+      userId: record.userId,
+      ...(record.taskClass ? { taskClass: record.taskClass } : {}),
+      ...(record.recipeId ? { recipeId: record.recipeId } : {}),
+      summary: record.summary,
+      keywords: parseStringArray(record.keywordsJson),
+      validated: Boolean(record.validated),
+      createdAt: record.createdAt.toISOString()
+    };
+  }
+}
+
+class PrismaArtifactIndexRepository implements ArtifactIndexRepository {
+  constructor(
+    private readonly prisma: PrismaClient,
+    private readonly bootstrap: PrismaSqliteBootstrap
+  ) {}
+
+  async save(entry: ArtifactIndexEntry): Promise<ArtifactIndexEntry> {
+    await this.bootstrap.ensureInitialized();
+    const record = await (this.prisma as any).artifactIndexRecord.upsert({
+      where: { id: entry.id },
+      update: {
+        taskId: entry.taskId,
+        stepId: entry.stepId ?? null,
+        artifactId: entry.artifactId,
+        artifactType: entry.artifactType,
+        uri: entry.uri,
+        title: entry.title ?? null,
+        summary: entry.summary ?? null,
+        keywordsJson: serializeJson(entry.keywords),
+        validated: entry.validated,
+        taskClass: entry.taskClass ?? null,
+        recipeId: entry.recipeId ?? null,
+        createdAt: toDate(entry.createdAt)
+      },
+      create: {
+        id: entry.id,
+        taskId: entry.taskId,
+        stepId: entry.stepId ?? null,
+        artifactId: entry.artifactId,
+        artifactType: entry.artifactType,
+        uri: entry.uri,
+        title: entry.title ?? null,
+        summary: entry.summary ?? null,
+        keywordsJson: serializeJson(entry.keywords),
+        validated: entry.validated,
+        taskClass: entry.taskClass ?? null,
+        recipeId: entry.recipeId ?? null,
+        createdAt: toDate(entry.createdAt)
+      }
+    });
+    return this.map(record);
+  }
+
+  async search(query: {
+    q?: string;
+    taskClass?: string;
+    artifactType?: string;
+    validatedOnly?: boolean;
+    limit?: number;
+  }): Promise<ArtifactIndexEntry[]> {
+    await this.bootstrap.ensureInitialized();
+    const records = await (this.prisma as any).artifactIndexRecord.findMany({
+      where: {
+        ...(query.taskClass ? { taskClass: query.taskClass } : {}),
+        ...(query.artifactType ? { artifactType: query.artifactType } : {}),
+        ...(query.validatedOnly ? { validated: true } : {})
+      },
+      orderBy: { createdAt: "desc" },
+      take: Math.max(1, query.limit ?? 20)
+    });
+
+    const normalizedQuery = String(query.q ?? "").trim().toLowerCase();
+    return records
+      .map((record: any) => this.map(record))
+      .filter((entry: ArtifactIndexEntry) => {
+        if (!normalizedQuery) {
+          return true;
+        }
+        const haystack = [
+          entry.title ?? "",
+          entry.summary ?? "",
+          ...entry.keywords,
+          entry.uri
+        ]
+          .join(" ")
+          .toLowerCase();
+        return haystack.includes(normalizedQuery);
+      });
+  }
+
+  async listByTask(taskId: string): Promise<ArtifactIndexEntry[]> {
+    await this.bootstrap.ensureInitialized();
+    const records = await (this.prisma as any).artifactIndexRecord.findMany({
+      where: { taskId },
+      orderBy: { createdAt: "asc" }
+    });
+    return records.map((record: any) => this.map(record));
+  }
+
+  private map(record: any): ArtifactIndexEntry {
+    return {
+      id: record.id,
+      taskId: record.taskId,
+      ...(record.stepId ? { stepId: record.stepId } : {}),
+      artifactId: record.artifactId,
+      artifactType: record.artifactType,
+      uri: record.uri,
+      ...(record.title ? { title: record.title } : {}),
+      ...(record.summary ? { summary: record.summary } : {}),
+      keywords: parseStringArray(record.keywordsJson),
+      validated: Boolean(record.validated),
+      ...(record.taskClass ? { taskClass: record.taskClass } : {}),
+      ...(record.recipeId ? { recipeId: record.recipeId } : {}),
+      createdAt: record.createdAt.toISOString()
+    };
+  }
+}
+
+class PrismaTaskReferenceRepository implements TaskReferenceRepository {
+  constructor(
+    private readonly prisma: PrismaClient,
+    private readonly bootstrap: PrismaSqliteBootstrap
+  ) {}
+
+  async save(reference: TaskReference): Promise<TaskReference> {
+    await this.bootstrap.ensureInitialized();
+    const record = await (this.prisma as any).taskReferenceRecord.create({
+      data: {
+        id: reference.id,
+        taskId: reference.taskId,
+        sourceTaskId: reference.sourceTaskId ?? null,
+        sourceArtifactId: reference.sourceArtifactId ?? null,
+        reason: reference.reason,
+        metadataJson: serializeJson(reference.metadata),
+        createdAt: toDate(reference.createdAt)
+      }
+    });
+    return this.map(record);
+  }
+
+  async listByTask(taskId: string): Promise<TaskReference[]> {
+    await this.bootstrap.ensureInitialized();
+    const records = await (this.prisma as any).taskReferenceRecord.findMany({
+      where: { taskId },
+      orderBy: { createdAt: "asc" }
+    });
+    return records.map((record: any) => this.map(record));
+  }
+
+  private map(record: any): TaskReference {
+    return {
+      id: record.id,
+      taskId: record.taskId,
+      ...(record.sourceTaskId ? { sourceTaskId: record.sourceTaskId } : {}),
+      ...(record.sourceArtifactId ? { sourceArtifactId: record.sourceArtifactId } : {}),
+      reason: record.reason,
+      metadata: parseJsonObject(record.metadataJson),
+      createdAt: record.createdAt.toISOString()
+    };
+  }
+}
+
+class PrismaBenchmarkRunRepository implements BenchmarkRunRepository {
+  constructor(
+    private readonly prisma: PrismaClient,
+    private readonly bootstrap: PrismaSqliteBootstrap
+  ) {}
+
+  async create(run: BenchmarkRun): Promise<BenchmarkRun> {
+    await this.bootstrap.ensureInitialized();
+    const record = await (this.prisma as any).benchmarkRunRecord.create({
+      data: {
+        id: run.id,
+        name: run.name,
+        suite: run.suite,
+        status: run.status,
+        startedAt: toDate(run.startedAt),
+        completedAt: run.completedAt ? toDate(run.completedAt) : null,
+        createdAt: toDate(run.createdAt),
+        metadataJson: serializeJson(run.metadata)
+      }
+    });
+    return this.map(record);
+  }
+
+  async update(run: BenchmarkRun): Promise<BenchmarkRun> {
+    await this.bootstrap.ensureInitialized();
+    const record = await (this.prisma as any).benchmarkRunRecord.update({
+      where: { id: run.id },
+      data: {
+        name: run.name,
+        suite: run.suite,
+        status: run.status,
+        startedAt: toDate(run.startedAt),
+        completedAt: run.completedAt ? toDate(run.completedAt) : null,
+        createdAt: toDate(run.createdAt),
+        metadataJson: serializeJson(run.metadata)
+      }
+    });
+    return this.map(record);
+  }
+
+  async getById(runId: string): Promise<BenchmarkRun | undefined> {
+    await this.bootstrap.ensureInitialized();
+    const record = await (this.prisma as any).benchmarkRunRecord.findUnique({
+      where: { id: runId }
+    });
+    return record ? this.map(record) : undefined;
+  }
+
+  async listRecent(limit = 20): Promise<BenchmarkRun[]> {
+    await this.bootstrap.ensureInitialized();
+    const records = await (this.prisma as any).benchmarkRunRecord.findMany({
+      orderBy: { createdAt: "desc" },
+      take: Math.max(1, limit)
+    });
+    return records.map((record: any) => this.map(record));
+  }
+
+  private map(record: any): BenchmarkRun {
+    return {
+      id: record.id,
+      name: record.name,
+      suite: record.suite,
+      status: record.status,
+      startedAt: record.startedAt.toISOString(),
+      ...(record.completedAt ? { completedAt: record.completedAt.toISOString() } : {}),
+      createdAt: record.createdAt.toISOString(),
+      metadata: parseJsonObject(record.metadataJson)
+    };
+  }
+}
+
+class PrismaBenchmarkRunItemRepository implements BenchmarkRunItemRepository {
+  constructor(
+    private readonly prisma: PrismaClient,
+    private readonly bootstrap: PrismaSqliteBootstrap
+  ) {}
+
+  async create(item: BenchmarkRunItem): Promise<BenchmarkRunItem> {
+    await this.bootstrap.ensureInitialized();
+    const record = await (this.prisma as any).benchmarkRunItemRecord.create({
+      data: {
+        id: item.id,
+        benchmarkRunId: item.benchmarkRunId,
+        caseId: item.caseId,
+        taskId: item.taskId ?? null,
+        completed: item.completed,
+        qualityScore: typeof item.qualityScore === "number" ? item.qualityScore : null,
+        fallbackUsed: item.fallbackUsed,
+        artifactValidated: item.artifactValidated,
+        latencyMs: typeof item.latencyMs === "number" ? Math.round(item.latencyMs) : null,
+        failureCategory: item.failureCategory ?? null,
+        createdAt: toDate(item.createdAt),
+        metadataJson: serializeJson(item.metadata)
+      }
+    });
+    return this.map(record);
+  }
+
+  async listByRun(benchmarkRunId: string): Promise<BenchmarkRunItem[]> {
+    await this.bootstrap.ensureInitialized();
+    const records = await (this.prisma as any).benchmarkRunItemRecord.findMany({
+      where: { benchmarkRunId },
+      orderBy: { createdAt: "asc" }
+    });
+    return records.map((record: any) => this.map(record));
+  }
+
+  private map(record: any): BenchmarkRunItem {
+    return {
+      id: record.id,
+      benchmarkRunId: record.benchmarkRunId,
+      caseId: record.caseId,
+      ...(record.taskId ? { taskId: record.taskId } : {}),
+      completed: Boolean(record.completed),
+      ...(typeof record.qualityScore === "number" ? { qualityScore: record.qualityScore } : {}),
+      fallbackUsed: Boolean(record.fallbackUsed),
+      artifactValidated: Boolean(record.artifactValidated),
+      ...(typeof record.latencyMs === "number" ? { latencyMs: record.latencyMs } : {}),
+      ...(record.failureCategory ? { failureCategory: record.failureCategory } : {}),
+      createdAt: record.createdAt.toISOString(),
+      metadata: parseJsonObject(record.metadataJson)
+    };
+  }
+}
+
 export interface RepositoryBundle {
   taskRepository: TaskRepository;
   taskEventRepository: TaskEventRepository;
   checkpointRepository: CheckpointRepository;
   artifactRepository: ArtifactRepository;
+  taskSummaryRepository: TaskSummaryRepository;
+  artifactIndexRepository: ArtifactIndexRepository;
+  taskReferenceRepository: TaskReferenceRepository;
   userProfileRepository: UserProfileRepository;
   toolCallRepository: ToolCallRepository;
   approvalRequestRepository: ApprovalRequestRepository;
   taskJobRepository: TaskJobRepository;
   memoryRepository: MemoryRepository;
+  benchmarkRunRepository: BenchmarkRunRepository;
+  benchmarkRunItemRepository: BenchmarkRunItemRepository;
   prisma?: PrismaClient;
 }
 
@@ -1456,11 +2086,16 @@ export const createInMemoryRepositories = (): RepositoryBundle => ({
   taskEventRepository: new InMemoryTaskEventRepository(),
   checkpointRepository: new InMemoryCheckpointRepository(),
   artifactRepository: new InMemoryArtifactRepository(),
+  taskSummaryRepository: new InMemoryTaskSummaryRepository(),
+  artifactIndexRepository: new InMemoryArtifactIndexRepository(),
+  taskReferenceRepository: new InMemoryTaskReferenceRepository(),
   userProfileRepository: new InMemoryUserProfileRepository(),
   toolCallRepository: new InMemoryToolCallRepository(),
   approvalRequestRepository: new InMemoryApprovalRequestRepository(),
   taskJobRepository: new InMemoryTaskJobRepository(),
-  memoryRepository: new InMemoryMemoryRepository()
+  memoryRepository: new InMemoryMemoryRepository(),
+  benchmarkRunRepository: new InMemoryBenchmarkRunRepository(),
+  benchmarkRunItemRepository: new InMemoryBenchmarkRunItemRepository()
 });
 
 export const createPrismaRepositories = (databaseUrl?: string): RepositoryBundle => {
@@ -1481,11 +2116,16 @@ export const createPrismaRepositories = (databaseUrl?: string): RepositoryBundle
     taskEventRepository: new PrismaTaskEventRepository(prisma, bootstrap),
     checkpointRepository: new PrismaCheckpointRepository(prisma, bootstrap),
     artifactRepository: new PrismaArtifactRepository(prisma, bootstrap),
+    taskSummaryRepository: new PrismaTaskSummaryRepository(prisma, bootstrap),
+    artifactIndexRepository: new PrismaArtifactIndexRepository(prisma, bootstrap),
+    taskReferenceRepository: new PrismaTaskReferenceRepository(prisma, bootstrap),
     userProfileRepository: new PrismaUserProfileRepository(prisma, bootstrap),
     toolCallRepository: new PrismaToolCallRepository(prisma, bootstrap),
     approvalRequestRepository: new PrismaApprovalRequestRepository(prisma, bootstrap),
     taskJobRepository: new PrismaTaskJobRepository(prisma, bootstrap),
     memoryRepository: new PrismaMemoryRepository(prisma, bootstrap),
+    benchmarkRunRepository: new PrismaBenchmarkRunRepository(prisma, bootstrap),
+    benchmarkRunItemRepository: new PrismaBenchmarkRunItemRepository(prisma, bootstrap),
     prisma
   };
 };

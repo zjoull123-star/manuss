@@ -35,6 +35,13 @@ export enum AgentKind {
   Verifier = "VerifierAgent"
 }
 
+export enum TaskClass {
+  ResearchBrowser = "research_browser",
+  CodingPython = "coding_python",
+  DocumentExport = "document_export",
+  ActionExecution = "action_execution"
+}
+
 export enum ToolName {
   Search = "search",
   Browser = "browser",
@@ -49,11 +56,27 @@ export enum ArtifactType {
   Json = "json",
   Markdown = "markdown",
   Pdf = "pdf",
+  Document = "document",
+  Presentation = "presentation",
   Spreadsheet = "spreadsheet",
   Text = "text",
   Screenshot = "screenshot",
   Report = "report",
   Generic = "generic"
+}
+
+export enum DeliveryKind {
+  Markdown = "markdown",
+  Pdf = "pdf",
+  Docx = "docx",
+  Pptx = "pptx",
+  Xlsx = "xlsx",
+  Json = "json",
+  Text = "text",
+  Webhook = "webhook",
+  Email = "email",
+  Slack = "slack",
+  Notion = "notion"
 }
 
 export enum ErrorCode {
@@ -98,7 +121,14 @@ export enum TaskEventKind {
   Approval = "approval",
   Checkpoint = "checkpoint",
   Error = "error",
-  Job = "job"
+  Job = "job",
+  QualityGateFailed = "quality_gate_failed",
+  RecoveryFallbackUsed = "recovery_fallback_used",
+  AttemptEscalated = "attempt_escalated",
+  StaleJobReclaimed = "stale_job_reclaimed",
+  ArtifactValidated = "artifact_validated",
+  TaskReferenced = "task_referenced",
+  BenchmarkRun = "benchmark_run"
 }
 
 export type RouteKind =
@@ -113,3 +143,10 @@ export type VerificationVerdict =
   | "retry_step"
   | "replan_task"
   | "ask_user";
+
+export enum BenchmarkRunStatus {
+  Pending = "PENDING",
+  Running = "RUNNING",
+  Completed = "COMPLETED",
+  Failed = "FAILED"
+}

@@ -2,6 +2,9 @@ const state = {
   selectedTaskId: null,
   tasks: [],
   selectedBundle: null,
+  recipes: [],
+  qualityMetrics: null,
+  benchmarkRuns: [],
   pollingHandle: null,
   eventStream: null,
   autoRefresh: true
@@ -15,11 +18,15 @@ const el = {
   taskForm: $("task-form"),
   userId: $("user-id"),
   goal: $("goal"),
+  recipeId: $("recipe-id"),
   createUploadInput: $("create-upload-input"),
   submitResult: $("submit-result"),
   refreshButton: $("refresh-button"),
   taskList: $("task-list"),
   taskCount: $("task-count"),
+  qualityMetrics: $("quality-metrics"),
+  benchmarkRuns: $("benchmark-runs"),
+  runSmokeBenchmark: $("run-smoke-benchmark"),
   selectedTaskStatus: $("selected-task-status"),
   detailEmpty: $("detail-empty"),
   detailBody: $("detail-body"),
@@ -30,10 +37,13 @@ const el = {
   taskUploadInput: $("task-upload-input"),
   taskUploadButton: $("task-upload-button"),
   finalArtifactPanel: $("final-artifact-panel"),
+  finalValidationPanel: $("final-validation-panel"),
+  referenceList: $("reference-list"),
   stepList: $("step-list"),
   approvalList: $("approval-list"),
   jobList: $("job-list"),
   artifactList: $("artifact-list"),
+  indexedArtifactList: $("indexed-artifact-list"),
   toolCallList: $("tool-call-list"),
   eventList: $("event-list"),
   artifactPreview: $("artifact-preview"),
@@ -165,6 +175,72 @@ const renderTaskList = () => {
   });
 };
 
+const renderRecipeOptions = () => {
+  const options = [
+    `<option value="">自动匹配</option>`,
+    ...state.recipes.map(
+      (recipe) => `<option value="${escapeHtml(recipe.id)}">${escapeHtml(recipe.title)}</option>`
+    )
+  ];
+  el.recipeId.innerHTML = options.join("");
+};
+
+const renderQualityMetrics = () => {
+  const metrics = state.qualityMetrics;
+  if (!metrics || !metrics.taskClasses) {
+    el.qualityMetrics.innerHTML = `<div class="event-card"><p class="muted">暂无质量指标。</p></div>`;
+    return;
+  }
+
+  const entries = Object.entries(metrics.taskClasses);
+  if (entries.length === 0) {
+    el.qualityMetrics.innerHTML = `<div class="event-card"><p class="muted">暂无质量指标。</p></div>`;
+    return;
+  }
+
+  el.qualityMetrics.innerHTML = entries
+    .map(([taskClass, entry]) => {
+      const total = Number(entry.total || 0);
+      const completed = Number(entry.completed || 0);
+      const failed = Number(entry.failed || 0);
+      const fallbackUsed = Number(entry.fallbackUsed || 0);
+      const completionRate = total > 0 ? `${Math.round((completed / total) * 100)}%` : "0%";
+      return `
+        <article class="event-card">
+          <div class="card-title">${escapeHtml(taskClass)}</div>
+          <div class="card-meta">
+            <span>steps=${escapeHtml(total)}</span>
+            <span>complete=${escapeHtml(completionRate)}</span>
+          </div>
+          <p>completed=${escapeHtml(completed)} failed=${escapeHtml(failed)} fallback=${escapeHtml(fallbackUsed)}</p>
+        </article>
+      `;
+    })
+    .join("");
+};
+
+const renderBenchmarkRuns = () => {
+  if (!state.benchmarkRuns.length) {
+    el.benchmarkRuns.innerHTML = `<div class="event-card"><p class="muted">暂无 benchmark 运行。</p></div>`;
+    return;
+  }
+
+  el.benchmarkRuns.innerHTML = state.benchmarkRuns
+    .map(
+      (run) => `
+        <article class="event-card">
+          <div class="card-title">${escapeHtml(run.name)}</div>
+          <div class="card-meta">
+            <span>${escapeHtml(run.suite)}</span>
+            <span class="status-${String(run.status).toLowerCase()}">${escapeHtml(run.status)}</span>
+          </div>
+          <p>items=${escapeHtml(run.items?.length || 0)} started=${escapeHtml(run.startedAt || "-")}</p>
+        </article>
+      `
+    )
+    .join("");
+};
+
 const renderSteps = (steps) =>
   steps
     .map(
@@ -175,14 +251,46 @@ const renderSteps = (steps) =>
             <span>${escapeHtml(step.agent)}</span>
             <span class="status-${String(step.status).toLowerCase()}">${escapeHtml(step.status)}</span>
             <span>retry=${escapeHtml(step.retryCount)}</span>
+            ${step.taskClass ? `<span>class=${escapeHtml(step.taskClass)}</span>` : ""}
+            ${typeof step.qualityScore === "number" ? `<span>quality=${escapeHtml(step.qualityScore)}</span>` : ""}
             ${
               step.structuredData?.llmFallbackUsed
                 ? `<span>fallback=${escapeHtml(step.structuredData.llmFallbackCategory || "local")}</span>`
                 : ""
             }
+            ${
+              step.attemptStrategy?.strategy
+                ? `<span>strategy=${escapeHtml(step.attemptStrategy.strategy)}</span>`
+                : ""
+            }
           </div>
           <p>${escapeHtml(step.objective)}</p>
           ${step.summary ? `<p><strong>Summary:</strong> ${escapeHtml(step.summary)}</p>` : ""}
+          ${
+            Array.isArray(step.qualityDefects) && step.qualityDefects.length > 0
+              ? `<p><strong>Defects:</strong> ${escapeHtml(step.qualityDefects.join("; "))}</p>`
+              : ""
+          }
+          ${
+            Array.isArray(step.missingEvidence) && step.missingEvidence.length > 0
+              ? `<p><strong>Missing Evidence:</strong> ${escapeHtml(step.missingEvidence.join("; "))}</p>`
+              : ""
+          }
+          ${
+            typeof step.sourceCoverageScore === "number"
+              ? `<p><strong>Source Coverage:</strong> ${escapeHtml(step.sourceCoverageScore)}</p>`
+              : ""
+          }
+          ${
+            step.formatCompliance
+              ? `<p><strong>Format:</strong> ${escapeHtml(step.formatCompliance)}</p>`
+              : ""
+          }
+          ${
+            step.structuredData?.artifactValidation
+              ? `<p><strong>Artifact Validation:</strong> ${escapeHtml(JSON.stringify(step.structuredData.artifactValidation))}</p>`
+              : ""
+          }
           ${
             step.error
               ? `
@@ -270,6 +378,74 @@ const renderFinalArtifact = (task, artifacts) => {
       </div>
     </article>
   `;
+};
+
+const renderFinalValidation = (validation) => {
+  if (!validation) {
+    return `<div class="artifact-card"><p class="muted">最终交付物尚未完成校验。</p></div>`;
+  }
+
+  return `
+    <article class="artifact-card">
+      <div class="card-title">${validation.validated ? "validated" : "needs review"}</div>
+      <div class="card-meta">
+        ${validation.artifactType ? `<span>${escapeHtml(validation.artifactType)}</span>` : ""}
+        ${validation.deliveryKind ? `<span>${escapeHtml(validation.deliveryKind)}</span>` : ""}
+        ${
+          typeof validation.pageCount === "number"
+            ? `<span>pages=${escapeHtml(validation.pageCount)}</span>`
+            : ""
+        }
+      </div>
+      ${
+        Array.isArray(validation.issues) && validation.issues.length > 0
+          ? `<p>${escapeHtml(validation.issues.join("; "))}</p>`
+          : `<p class="muted">未发现阻断问题。</p>`
+      }
+    </article>
+  `;
+};
+
+const renderReferences = (references) => {
+  if (!references || references.length === 0) {
+    return `<div class="artifact-card"><p class="muted">当前任务暂无历史引用。</p></div>`;
+  }
+
+  return references
+    .map(
+      (reference) => `
+        <article class="artifact-card">
+          <div class="card-title">${escapeHtml(reference.reason)}</div>
+          <div class="card-meta">
+            ${reference.sourceTaskId ? `<span>task=${escapeHtml(reference.sourceTaskId)}</span>` : ""}
+            ${reference.sourceArtifactId ? `<span>artifact=${escapeHtml(reference.sourceArtifactId)}</span>` : ""}
+          </div>
+        </article>
+      `
+    )
+    .join("");
+};
+
+const renderIndexedArtifacts = (indexedArtifacts) => {
+  if (!indexedArtifacts || indexedArtifacts.length === 0) {
+    return `<div class="tool-call-card"><p class="muted">暂无已索引产物。</p></div>`;
+  }
+
+  return indexedArtifacts
+    .map(
+      (artifact) => `
+        <article class="tool-call-card">
+          <div class="card-title">${escapeHtml(artifact.title || artifact.artifactType)}</div>
+          <div class="tool-call-meta">
+            <span>${escapeHtml(artifact.artifactType)}</span>
+            <span>${artifact.validated ? "validated" : "unvalidated"}</span>
+            ${artifact.taskClass ? `<span>${escapeHtml(artifact.taskClass)}</span>` : ""}
+          </div>
+          ${artifact.summary ? `<p>${escapeHtml(artifact.summary)}</p>` : ""}
+        </article>
+      `
+    )
+    .join("");
 };
 
 const renderApprovals = (approvals) => {
@@ -455,6 +631,9 @@ const renderSelectedTask = () => {
     el.taskControls.innerHTML = "";
     el.taskActionResult.textContent = "等待操作。";
     el.eventList.innerHTML = "";
+    el.finalValidationPanel.innerHTML = "";
+    el.referenceList.innerHTML = "";
+    el.indexedArtifactList.innerHTML = "";
     return;
   }
 
@@ -465,11 +644,14 @@ const renderSelectedTask = () => {
   el.detailGoal.textContent = bundle.task.goal;
   el.taskControls.innerHTML = renderTaskControls(bundle.task);
   el.finalArtifactPanel.innerHTML = renderFinalArtifact(bundle.task, bundle.artifacts || []);
+  el.finalValidationPanel.innerHTML = renderFinalValidation(bundle.finalArtifactValidation);
+  el.referenceList.innerHTML = renderReferences(bundle.references || []);
   el.stepTimeline.innerHTML = renderStepTimeline(bundle.task.steps || []);
   el.stepList.innerHTML = renderSteps(bundle.task.steps || []);
   el.approvalList.innerHTML = renderApprovals(bundle.approvals || []);
   el.jobList.innerHTML = renderJobs(bundle.jobs || []);
   el.artifactList.innerHTML = renderArtifacts(bundle.artifacts || [], bundle.task.finalArtifactUri);
+  el.indexedArtifactList.innerHTML = renderIndexedArtifacts(bundle.indexedArtifacts || []);
   el.toolCallList.innerHTML = renderToolCalls(bundle.toolCalls || []);
   el.eventList.innerHTML = renderEvents(bundle.events || []);
   bindEventInteractions();
@@ -600,6 +782,24 @@ const refreshTasks = async () => {
   renderTaskList();
 };
 
+const refreshRecipes = async () => {
+  const payload = await jsonFetch("/recipes");
+  state.recipes = payload.recipes || [];
+  renderRecipeOptions();
+};
+
+const refreshQualityMetrics = async () => {
+  const payload = await jsonFetch("/metrics/quality");
+  state.qualityMetrics = payload.metrics || null;
+  renderQualityMetrics();
+};
+
+const refreshBenchmarkRuns = async () => {
+  const payload = await jsonFetch("/benchmarks/runs?limit=12");
+  state.benchmarkRuns = payload.runs || [];
+  renderBenchmarkRuns();
+};
+
 const refreshSelectedTask = async () => {
   if (!state.selectedTaskId) {
     stopEventStream();
@@ -626,6 +826,7 @@ const submitTask = async (event) => {
       body: JSON.stringify({
         userId: el.userId.value.trim() || "local_console_user",
         goal: el.goal.value.trim(),
+        recipeId: el.recipeId.value || undefined,
         deferStart: createFiles.length > 0
       })
     });
@@ -655,6 +856,9 @@ const submitTask = async (event) => {
 
 const refreshAll = async () => {
   await renderRuntime();
+  await refreshRecipes();
+  await refreshQualityMetrics();
+  await refreshBenchmarkRuns();
   await refreshTasks();
   await refreshSelectedTask();
 };
@@ -665,6 +869,24 @@ el.taskForm.addEventListener("submit", (event) => {
 
 el.refreshButton.addEventListener("click", () => {
   void refreshAll();
+});
+
+el.runSmokeBenchmark.addEventListener("click", async () => {
+  el.submitResult.textContent = "正在启动 smoke benchmark...";
+  try {
+    const payload = await jsonFetch("/benchmarks/runs", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        name: `smoke benchmark ${new Date().toISOString()}`,
+        suite: "smoke"
+      })
+    });
+    el.submitResult.textContent = `已启动 benchmark ${payload.run.id}`;
+    await refreshBenchmarkRuns();
+  } catch (error) {
+    el.submitResult.textContent = error.message;
+  }
 });
 
 const savedTheme = localStorage.getItem("openclaw-theme") || "light";
@@ -692,6 +914,8 @@ const pollingTick = () => {
   void refreshTasks();
   void refreshSelectedTask();
   void renderRuntime();
+  void refreshQualityMetrics();
+  void refreshBenchmarkRuns();
 };
 
 setPreviewMessage("点击产物进行预览。");

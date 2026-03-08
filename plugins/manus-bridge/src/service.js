@@ -1,5 +1,28 @@
 import path from "node:path";
 
+function buildProgressMessage(task) {
+  switch (task.status) {
+    case "CREATED":
+      return `任务 ${task.id} 已接收，正在进入规划队列。`;
+    case "PLANNED":
+      return `任务 ${task.id} 规划完成，准备开始执行。`;
+    case "RUNNING":
+    case "RETRYING":
+    case "VERIFYING":
+      return `任务 ${task.id} 正在执行中。`;
+    case "WAITING_APPROVAL":
+      return `任务 ${task.id} 正在等待审批。`;
+    case "FAILED":
+      return `任务 ${task.id} 执行失败。请在本地控制台查看失败类别、质量缺陷和重试建议。`;
+    case "COMPLETED":
+      return `任务 ${task.id} 已完成。`;
+    case "CANCELLED":
+      return `任务 ${task.id} 已取消。`;
+    default:
+      return null;
+  }
+}
+
 function buildCompletionMessage(task) {
   const lines = [`任务 ${task.id} 已${task.status === "COMPLETED" ? "完成" : "结束"}.`, `状态: ${task.status}`];
   if (task.finalArtifactUri) {
@@ -78,6 +101,20 @@ export function createManusPollerService(api, client, store, config) {
           continue;
         }
 
+        const progressMessage = buildProgressMessage(task);
+        if (
+          progressMessage &&
+          trackedTask.lastProgressStatus !== task.status &&
+          !["COMPLETED", "FAILED", "CANCELLED", "WAITING_APPROVAL"].includes(task.status)
+        ) {
+          const sent = await sendOriginMessage(api.runtime, api.logger, origin, progressMessage);
+          if (sent) {
+            await store.updateTrackedTask(trackedTask.taskId, {
+              lastProgressStatus: task.status
+            });
+          }
+        }
+
         if (task.status === "WAITING_APPROVAL") {
           const approvalPayload = await client.listApprovals(trackedTask.taskId);
           const pendingApproval = Array.isArray(approvalPayload.approvals)
@@ -92,7 +129,8 @@ export function createManusPollerService(api, client, store, config) {
             );
             if (sent) {
               await store.updateTrackedTask(trackedTask.taskId, {
-                lastApprovalId: pendingApproval.id
+                lastApprovalId: pendingApproval.id,
+                lastProgressStatus: task.status
               });
             }
           }

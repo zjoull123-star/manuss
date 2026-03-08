@@ -39,6 +39,7 @@ export class ManusBridgeStore {
       origin,
       conversationKey,
       lastStatus: existing.lastStatus ?? null,
+      lastProgressStatus: existing.lastProgressStatus ?? null,
       lastApprovalId: existing.lastApprovalId ?? null,
       terminalNotifiedAt: existing.terminalNotifiedAt ?? null
     };

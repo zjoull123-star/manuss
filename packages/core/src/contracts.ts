@@ -8,6 +8,9 @@ import {
 import {
   ApprovalRequest,
   Artifact,
+  ArtifactIndexEntry,
+  BenchmarkRun,
+  BenchmarkRunItem,
   Checkpoint,
   MemoryRecord,
   Plan,
@@ -15,6 +18,8 @@ import {
   TaskEvent,
   TaskJob,
   TaskError,
+  TaskReference,
+  TaskSummary,
   TaskStep,
   ToolCall,
   UserProfile
@@ -58,6 +63,11 @@ export interface VerificationDecision {
   missingCriteria: string[];
   suggestedFix: string;
   confidence: number;
+  qualityScore?: number;
+  qualityDefects?: string[];
+  missingEvidence?: string[];
+  sourceCoverageScore?: number;
+  formatCompliance?: string;
 }
 
 export interface ToolRequest {
@@ -112,6 +122,29 @@ export interface ArtifactRepository {
   listByTask(taskId: string): Promise<Artifact[]>;
 }
 
+export interface TaskSummaryRepository {
+  save(summary: TaskSummary): Promise<TaskSummary>;
+  listRecentByUser(userId: string, limit?: number): Promise<TaskSummary[]>;
+  listByTask(taskId: string): Promise<TaskSummary[]>;
+}
+
+export interface ArtifactIndexRepository {
+  save(entry: ArtifactIndexEntry): Promise<ArtifactIndexEntry>;
+  search(query: {
+    q?: string;
+    taskClass?: string;
+    artifactType?: string;
+    validatedOnly?: boolean;
+    limit?: number;
+  }): Promise<ArtifactIndexEntry[]>;
+  listByTask(taskId: string): Promise<ArtifactIndexEntry[]>;
+}
+
+export interface TaskReferenceRepository {
+  save(reference: TaskReference): Promise<TaskReference>;
+  listByTask(taskId: string): Promise<TaskReference[]>;
+}
+
 export interface UserProfileRepository {
   getByUserId(userId: string): Promise<UserProfile | undefined>;
   save(profile: UserProfile): Promise<UserProfile>;
@@ -152,6 +185,18 @@ export interface MemoryRepository {
   listByTask(taskId: string): Promise<MemoryRecord[]>;
 }
 
+export interface BenchmarkRunRepository {
+  create(run: BenchmarkRun): Promise<BenchmarkRun>;
+  update(run: BenchmarkRun): Promise<BenchmarkRun>;
+  getById(runId: string): Promise<BenchmarkRun | undefined>;
+  listRecent(limit?: number): Promise<BenchmarkRun[]>;
+}
+
+export interface BenchmarkRunItemRepository {
+  create(item: BenchmarkRunItem): Promise<BenchmarkRunItem>;
+  listByRun(benchmarkRunId: string): Promise<BenchmarkRunItem[]>;
+}
+
 export interface PlanningAgent {
   createPlan(goal: string, context: JsonObject): Promise<Plan>;
 }
@@ -166,4 +211,8 @@ export interface VerifyingAgent {
     step: TaskStep,
     response: AgentResponse
   ): Promise<VerificationDecision>;
+}
+
+export interface ReplanningAgent {
+  repairPlan(task: Task, failedStep: TaskStep, context: JsonObject): Promise<Plan>;
 }

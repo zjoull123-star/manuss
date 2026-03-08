@@ -1,6 +1,10 @@
 import { spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import { Document as DocxDocument, HeadingLevel, Packer, Paragraph, TextRun } from "docx";
+import ExcelJS from "exceljs";
+import nodemailer from "nodemailer";
+import PptxGenJS from "pptxgenjs";
 import {
   createTaskEvent,
   ErrorCode,
@@ -46,6 +50,17 @@ export interface ActionToolOptions {
   defaultUrl?: string;
   defaultHeaders?: Record<string, string>;
   timeoutMs?: number;
+  smtp?: {
+    host?: string;
+    port?: number;
+    user?: string;
+    pass?: string;
+    from?: string;
+    secure?: boolean;
+  };
+  slackWebhookUrl?: string;
+  notionToken?: string;
+  notionParentPageId?: string;
 }
 
 export interface PythonToolOptions {
@@ -278,6 +293,170 @@ const collectFilesRecursive = async (rootDir: string): Promise<string[]> => {
   return files;
 };
 
+const inferArtifactTypeFromPath = (filePath: string) => {
+  const extension = path.extname(filePath).toLowerCase();
+  if (extension === ".pdf") {
+    return "pdf";
+  }
+  if (extension === ".md") {
+    return "markdown";
+  }
+  if (extension === ".docx") {
+    return "document";
+  }
+  if (extension === ".pptx") {
+    return "presentation";
+  }
+  if (extension === ".xlsx" || extension === ".xls" || extension === ".csv") {
+    return "spreadsheet";
+  }
+  if (extension === ".json") {
+    return "json";
+  }
+  if (extension === ".txt") {
+    return "text";
+  }
+  return "generic";
+};
+
+const stripMarkdownFormatting = (value: string): string =>
+  value
+    .replace(/^#{1,6}\s+/gm, "")
+    .replace(/[*_`>#-]/g, "")
+    .trim();
+
+const splitMarkdownSections = (markdownBody: string): Array<{ heading: string; body: string }> => {
+  const lines = markdownBody.split(/\r?\n/);
+  const sections: Array<{ heading: string; body: string }> = [];
+  let currentHeading = "内容";
+  let currentLines: string[] = [];
+
+  const pushCurrent = () => {
+    if (currentLines.length === 0 && sections.length > 0) {
+      return;
+    }
+    sections.push({
+      heading: currentHeading,
+      body: currentLines.join("\n").trim()
+    });
+  };
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (/^#{1,6}\s+/.test(trimmed)) {
+      pushCurrent();
+      currentHeading = trimmed.replace(/^#{1,6}\s+/, "").trim() || "内容";
+      currentLines = [];
+      continue;
+    }
+    currentLines.push(line);
+  }
+  pushCurrent();
+
+  return sections.filter((section) => section.heading || section.body);
+};
+
+const buildArtifactValidation = (
+  filePath: string,
+  preview: string,
+  issues: string[] = []
+): JsonObject => ({
+  artifactType: inferArtifactTypeFromPath(filePath),
+  validated: issues.length === 0 && preview.trim().length > 0,
+  issues,
+  preview: trimText(preview, 1000)
+});
+
+type NormalizedSection = {
+  heading: string;
+  body: string;
+};
+
+type NormalizedTable = {
+  title: string;
+  columns: string[];
+  rows: string[][];
+};
+
+const normalizeSections = (request: ToolRequest, body: string): NormalizedSection[] => {
+  const provided = Array.isArray(request.input["sections"]) ? request.input["sections"] : [];
+  const normalized = provided
+    .map((item) => asJsonObject(item))
+    .map((item) => ({
+      heading: asString(item["heading"], "内容"),
+      body: asString(item["body"])
+    }))
+    .filter((item) => item.heading.trim().length > 0 || item.body.trim().length > 0);
+
+  if (normalized.length > 0) {
+    return normalized;
+  }
+
+  return splitMarkdownSections(body).map((section) => ({
+    heading: section.heading,
+    body: section.body
+  }));
+};
+
+const normalizeTables = (request: ToolRequest): NormalizedTable[] => {
+  const provided = Array.isArray(request.input["tables"]) ? request.input["tables"] : [];
+  return provided
+    .map((item) => asJsonObject(item))
+    .map((item) => {
+      const title = asString(item["title"], "Table");
+      const columns = Array.isArray(item["columns"])
+        ? item["columns"].map((value) => String(value))
+        : [];
+      const rows = Array.isArray(item["rows"])
+        ? item["rows"]
+            .map((row) => (Array.isArray(row) ? row.map((cell) => String(cell ?? "")) : []))
+            .filter((row) => row.length > 0)
+        : [];
+      return { title, columns, rows };
+    })
+    .filter((table) => table.columns.length > 0 || table.rows.length > 0);
+};
+
+const extractTextPreviewFromSections = (
+  title: string,
+  sections: NormalizedSection[],
+  body: string
+): string => {
+  if (sections.length === 0) {
+    return trimText(`${title}\n\n${body}`, 1_200);
+  }
+
+  return trimText(
+    [
+      title,
+      ...sections.flatMap((section) => [section.heading, section.body].filter(Boolean))
+    ].join("\n\n"),
+    1_200
+    );
+};
+
+const buildBrowserOutput = (base: {
+  currentUrl: string;
+  pageTitle: string;
+  browserProfileId: string;
+  profileDir: string;
+  canonicalUrl?: string | null;
+  downloadDir?: string;
+  storageStatePath?: string;
+  downloadedFile?: string;
+  extractedText?: string;
+}): JsonObject => ({
+  currentUrl: base.currentUrl,
+  pageTitle: base.pageTitle,
+  browserProfileId: base.browserProfileId,
+  profileDir: base.profileDir,
+  ...(base.canonicalUrl ? { canonicalUrl: base.canonicalUrl } : {}),
+  ...(base.downloadDir ? { downloadDir: base.downloadDir } : {}),
+  ...(base.storageStatePath ? { storageStatePath: base.storageStatePath } : {}),
+  ...(base.downloadedFile ? { downloadedFile: base.downloadedFile } : {}),
+  ...(typeof base.extractedText === "string" ? { extractedText: base.extractedText } : {})
+});
+
 export class SearchTool implements Tool {
   readonly name = ToolName.Search;
 
@@ -300,6 +479,21 @@ export class SearchTool implements Tool {
               title: "Mock competitor profile",
               url: "https://example.com/mock-competitor",
               snippet: `Synthetic search result for ${query}`
+            },
+            {
+              title: "Regional market overview",
+              url: "https://market.example/regional-overview",
+              snippet: `Regional market overview and demand signals related to ${query}`
+            },
+            {
+              title: "Official guidance",
+              url: "https://gov.example/official-guidance",
+              snippet: `Official guidance and regulatory considerations relevant to ${query}`
+            },
+            {
+              title: "Industry setup playbook",
+              url: "https://industry.example/setup-playbook",
+              snippet: `Industry setup, licensing, and operational guidance related to ${query}`
             }
           ]
         },
@@ -367,7 +561,7 @@ export class BrowserTool implements Tool {
 
   async execute(request: ToolRequest): Promise<ToolResponse> {
     const action = request.action;
-    if (!["open", "extract", "click", "type", "wait_for", "download", "screenshot"].includes(action)) {
+    if (!["open", "extract", "click", "type", "wait_for", "download", "screenshot", "save_storage_state", "load_storage_state"].includes(action)) {
       return normalizeToolFailure(
         `Unsupported browser action: ${action}`,
         ErrorCode.InvalidInput,
@@ -398,8 +592,13 @@ export class BrowserTool implements Tool {
 
     const startedAt = Date.now();
     const { chromium } = await import("playwright");
+    let persistentContext: Awaited<ReturnType<typeof chromium.launchPersistentContext>> | undefined;
+    let page:
+      | Awaited<ReturnType<Awaited<ReturnType<typeof chromium.launchPersistentContext>>["newPage"]>>
+      | undefined;
+    let taskDir = "";
     try {
-      const taskDir = await this.workspaceManager.ensureTaskWorkspace(request.taskId);
+      taskDir = await this.workspaceManager.ensureTaskWorkspace(request.taskId);
       const profileId =
         request.browserProfileId ?? asString(request.input["browserProfileId"], "default");
       const profileRootDir =
@@ -420,30 +619,108 @@ export class BrowserTool implements Tool {
         : defaultDownloadDir;
       await fs.mkdir(downloadDir, { recursive: true });
 
-      const persistentContext = await chromium.launchPersistentContext(profileDir, {
+      persistentContext = await chromium.launchPersistentContext(profileDir, {
         headless: this.options.headless ?? true,
         acceptDownloads: true,
         ...(this.options.channel ? { channel: this.options.channel as "chrome" | "msedge" } : {}),
         ...(this.options.executablePath ? { executablePath: this.options.executablePath } : {})
       });
 
-      try {
-        const page = persistentContext.pages()[0] ?? (await persistentContext.newPage());
-        await page.goto(url, {
+      page = persistentContext.pages()[0] ?? (await persistentContext.newPage());
+      const activePage = page;
+      if (!activePage) {
+        return normalizeToolFailure(
+          "Playwright browser did not create a page",
+          ErrorCode.ToolUnavailable,
+          true
+        );
+      }
+      if (action === "load_storage_state") {
+        const relativeStoragePath = sanitizeRelativePath(
+          asString(request.input["storageStatePath"], "browser/storage-state.json")
+        );
+        const storageStatePath = path.join(taskDir, relativeStoragePath);
+        const raw = await fs.readFile(storageStatePath, "utf8");
+        const storageState = JSON.parse(raw) as {
+          cookies?: Array<Record<string, unknown>>;
+          origins?: Array<{ origin: string; localStorage?: Array<{ name: string; value: string }> }>;
+        };
+        if (Array.isArray(storageState.cookies) && storageState.cookies.length > 0) {
+          await persistentContext.addCookies(
+            storageState.cookies as unknown as Parameters<typeof persistentContext.addCookies>[0]
+          );
+        }
+        if (Array.isArray(storageState.origins) && storageState.origins.length > 0) {
+          await activePage.addInitScript((origins) => {
+            for (const originEntry of origins) {
+              if (!originEntry || typeof originEntry.origin !== "string") {
+                continue;
+              }
+              const browserWindow = globalThis as {
+                location?: { origin?: string };
+                localStorage?: { setItem: (name: string, value: string) => void };
+              };
+              if (browserWindow.location?.origin !== originEntry.origin) {
+                continue;
+              }
+              if (!Array.isArray(originEntry.localStorage)) {
+                continue;
+              }
+              for (const pair of originEntry.localStorage) {
+                if (pair && typeof pair.name === "string" && typeof pair.value === "string") {
+                  browserWindow.localStorage?.setItem(pair.name, pair.value);
+                }
+              }
+            }
+          }, storageState.origins);
+        }
+      }
+        await activePage.goto(url, {
           waitUntil: "domcontentloaded",
           timeout: this.options.navigationTimeoutMs ?? 30_000
         });
+
+        const canonicalUrl = await activePage
+          .locator("link[rel='canonical']")
+          .getAttribute("href")
+          .catch(() => null);
 
         if (action === "open") {
           return {
             status: "success",
             summary: `Opened ${url}`,
-            output: {
-              currentUrl: page.url(),
-              pageTitle: await page.title(),
+            output: buildBrowserOutput({
+              currentUrl: activePage.url(),
+              pageTitle: await activePage.title(),
+              canonicalUrl,
               browserProfileId: profileId,
               profileDir
-            },
+            }),
+            metrics: {
+              durationMs: Date.now() - startedAt
+            }
+          };
+        }
+
+        if (action === "save_storage_state") {
+          const relativeStoragePath = sanitizeRelativePath(
+            asString(request.input["storageStatePath"], "browser/storage-state.json")
+          );
+          const storageStatePath = path.join(taskDir, relativeStoragePath);
+          await fs.mkdir(path.dirname(storageStatePath), { recursive: true });
+          await persistentContext.storageState({ path: storageStatePath });
+          return {
+            status: "success",
+            summary: `Saved browser storage state for ${url}`,
+            output: buildBrowserOutput({
+              currentUrl: activePage.url(),
+              pageTitle: await activePage.title(),
+              canonicalUrl,
+              browserProfileId: profileId,
+              profileDir,
+              storageStatePath
+            }),
+            artifacts: [storageStatePath],
             metrics: {
               durationMs: Date.now() - startedAt
             }
@@ -459,18 +736,19 @@ export class BrowserTool implements Tool {
               false
             );
           }
-          await page.click(selector, {
+          await activePage.click(selector, {
             timeout: request.timeoutMs ?? this.options.navigationTimeoutMs ?? 30_000
           });
           return {
             status: "success",
             summary: `Clicked ${selector} on ${url}`,
-            output: {
-              currentUrl: page.url(),
-              pageTitle: await page.title(),
+            output: buildBrowserOutput({
+              currentUrl: activePage.url(),
+              pageTitle: await activePage.title(),
+              canonicalUrl,
               browserProfileId: profileId,
               profileDir
-            },
+            }),
             metrics: {
               durationMs: Date.now() - startedAt
             }
@@ -487,18 +765,19 @@ export class BrowserTool implements Tool {
               false
             );
           }
-          await page.fill(selector, text, {
+          await activePage.fill(selector, text, {
             timeout: request.timeoutMs ?? this.options.navigationTimeoutMs ?? 30_000
           });
           return {
             status: "success",
             summary: `Typed into ${selector} on ${url}`,
-            output: {
-              currentUrl: page.url(),
-              pageTitle: await page.title(),
+            output: buildBrowserOutput({
+              currentUrl: activePage.url(),
+              pageTitle: await activePage.title(),
+              canonicalUrl,
               browserProfileId: profileId,
               profileDir
-            },
+            }),
             metrics: {
               durationMs: Date.now() - startedAt
             }
@@ -514,18 +793,19 @@ export class BrowserTool implements Tool {
               false
             );
           }
-          await page.waitForSelector(selector, {
+          await activePage.waitForSelector(selector, {
             timeout: request.timeoutMs ?? this.options.navigationTimeoutMs ?? 30_000
           });
           return {
             status: "success",
             summary: `Waited for ${selector} on ${url}`,
-            output: {
-              currentUrl: page.url(),
-              pageTitle: await page.title(),
+            output: buildBrowserOutput({
+              currentUrl: activePage.url(),
+              pageTitle: await activePage.title(),
+              canonicalUrl,
               browserProfileId: profileId,
               profileDir
-            },
+            }),
             metrics: {
               durationMs: Date.now() - startedAt
             }
@@ -541,10 +821,10 @@ export class BrowserTool implements Tool {
               false
             );
           }
-          const downloadPromise = page.waitForEvent("download", {
+          const downloadPromise = activePage.waitForEvent("download", {
             timeout: request.timeoutMs ?? this.options.navigationTimeoutMs ?? 30_000
           });
-          await page.click(selector, {
+          await activePage.click(selector, {
             timeout: request.timeoutMs ?? this.options.navigationTimeoutMs ?? 30_000
           });
           const download = await downloadPromise;
@@ -559,14 +839,15 @@ export class BrowserTool implements Tool {
           return {
             status: "success",
             summary: `Downloaded file from ${url}`,
-            output: {
-              currentUrl: page.url(),
-              pageTitle: await page.title(),
+            output: buildBrowserOutput({
+              currentUrl: activePage.url(),
+              pageTitle: await activePage.title(),
+              canonicalUrl,
               browserProfileId: profileId,
               profileDir,
               downloadDir,
               downloadedFile: savedPath
-            },
+            }),
             artifacts: [savedPath],
             metrics: {
               durationMs: Date.now() - startedAt
@@ -590,7 +871,7 @@ export class BrowserTool implements Tool {
 
         if (screenshotPath) {
           await fs.mkdir(path.dirname(screenshotPath), { recursive: true });
-          await page.screenshot({
+          await activePage.screenshot({
             path: screenshotPath,
             fullPage: true
           });
@@ -600,12 +881,13 @@ export class BrowserTool implements Tool {
           return {
             status: "success",
             summary: `Captured screenshot for ${url}`,
-            output: {
-              currentUrl: page.url(),
-              pageTitle: await page.title(),
+            output: buildBrowserOutput({
+              currentUrl: activePage.url(),
+              pageTitle: await activePage.title(),
+              canonicalUrl,
               browserProfileId: profileId,
               profileDir
-            },
+            }),
             ...(screenshotPath ? { artifacts: [screenshotPath] } : {}),
             metrics: {
               durationMs: Date.now() - startedAt
@@ -614,13 +896,13 @@ export class BrowserTool implements Tool {
         }
 
         const selector = asString(request.input["selector"], "body");
-        const locator = page.locator(selector);
+        const locator = activePage.locator(selector);
         const rawText =
           (await locator
             .innerText({
               timeout: 5_000
             })
-            .catch(async () => (await page.locator("body").textContent()) ?? "")) ?? "";
+            .catch(async () => (await activePage.locator("body").textContent()) ?? "")) ?? "";
         const extractedText = trimText(
           rawText,
           typeof request.input["maxChars"] === "number"
@@ -628,14 +910,15 @@ export class BrowserTool implements Tool {
             : this.options.maxExtractedChars ?? 12_000
         );
 
-        const output: JsonObject = {
-          currentUrl: page.url(),
-          pageTitle: await page.title(),
+        const output = buildBrowserOutput({
+          currentUrl: activePage.url(),
+          canonicalUrl,
+          pageTitle: await activePage.title(),
           extractedText,
           browserProfileId: profileId,
           profileDir,
           downloadDir
-        };
+        });
 
         return {
           status: "success",
@@ -646,16 +929,36 @@ export class BrowserTool implements Tool {
             durationMs: Date.now() - startedAt
           }
         };
-      } finally {
-        await persistentContext.close();
-      }
     } catch (error: unknown) {
+      const failureScreenshotPath =
+        taskDir && request.stepId
+          ? path.join(taskDir, "screenshots", `${request.stepId}-failure.png`)
+          : undefined;
+      if (page !== undefined && failureScreenshotPath) {
+        try {
+          await fs.mkdir(path.dirname(failureScreenshotPath), { recursive: true });
+          await page.screenshot({
+            path: failureScreenshotPath,
+            fullPage: true
+          });
+        } catch {
+          // Best effort failure evidence only.
+        }
+      }
       const message = error instanceof Error ? error.message : String(error);
-      return normalizeToolFailure(
+      const response = normalizeToolFailure(
         `Playwright browser execution failed: ${message}`,
         ErrorCode.ToolUnavailable,
         true
       );
+      if (failureScreenshotPath) {
+        response.artifacts = [failureScreenshotPath];
+      }
+      return response;
+    } finally {
+      if (persistentContext) {
+        await persistentContext.close().catch(() => {});
+      }
     }
   }
 }
@@ -686,16 +989,66 @@ export class PythonTool implements Tool {
     const filename = `${filenameToken || "script"}.py`;
 
     if (this.options.mode !== "live") {
+      const taskDir = await this.workspaceManager.ensureTaskWorkspace(request.taskId);
+      const sandboxDir = path.join(taskDir, "python", sanitizeFileToken(request.stepId || "step"));
+      await fs.mkdir(sandboxDir, { recursive: true });
+      const scriptPath = path.join(sandboxDir, filename);
+      await fs.writeFile(scriptPath, code, "utf8");
+
+      const requestedInputFiles =
+        Array.isArray(request.inputFiles) && request.inputFiles.length > 0
+          ? request.inputFiles.map(String)
+          : [];
+      const generatedFiles: string[] = [];
+      const jsonPath = path.join(sandboxDir, "analysis.json");
+      const markdownPath = path.join(sandboxDir, "summary.md");
+      await fs.writeFile(
+        jsonPath,
+        JSON.stringify(
+          {
+            mode: "mock",
+            taskId: request.taskId,
+            stepId: request.stepId ?? "step",
+            inputFiles: requestedInputFiles
+          },
+          null,
+          2
+        ),
+        "utf8"
+      );
+      await fs.writeFile(
+        markdownPath,
+        [
+          `# Mock Python Output`,
+          ``,
+          `- taskId: ${request.taskId}`,
+          `- stepId: ${request.stepId ?? "step"}`,
+          ...(requestedInputFiles.length > 0
+            ? [`- inputFiles: ${requestedInputFiles.join(", ")}`]
+            : [`- inputFiles: none`])
+        ].join("\n"),
+        "utf8"
+      );
+      generatedFiles.push(jsonPath, markdownPath);
+
+      if (/brief\.pdf|\.pdf\b/i.test(code) || /pdf/i.test(filenameToken)) {
+        const pdfPath = path.join(sandboxDir, "brief.pdf");
+        await fs.writeFile(pdfPath, "Mock PDF artifact", "utf8");
+        generatedFiles.push(pdfPath);
+      }
+
       return {
         status: "success",
         summary: `Prepared mock python execution for ${filename}`,
         output: {
-          scriptPath: `/mock/${request.taskId}/${filename}`,
+          scriptPath,
           stdout: "mock python execution",
           stderr: "",
           exitCode: 0,
-          generatedFiles: []
+          inputFiles: requestedInputFiles,
+          generatedFiles
         },
+        artifacts: [scriptPath, ...generatedFiles],
         metrics: {
           durationMs: 5
         }
@@ -915,7 +1268,15 @@ export class DocumentTool implements Tool {
   ) {}
 
   async execute(request: ToolRequest): Promise<ToolResponse> {
-    if (request.action !== "render_markdown" && request.action !== "render_pdf") {
+    if (
+      ![
+        "render_markdown",
+        "render_pdf",
+        "render_docx",
+        "render_pptx",
+        "render_xlsx"
+      ].includes(request.action)
+    ) {
       return normalizeToolFailure(
         `Unsupported document action: ${request.action}`,
         ErrorCode.InvalidInput,
@@ -925,7 +1286,7 @@ export class DocumentTool implements Tool {
 
     const filename = String(request.input["filename"] ?? "report.md");
     const title = String(request.input["title"] ?? "Task Output");
-    const body = String(request.input["body"] ?? "");
+    const body = String(request.input["body"] ?? request.input["markdownBody"] ?? "");
     const generationPrompt = asString(request.input["generationPrompt"]);
     const useLlm =
       this.options.mode === "live" &&
@@ -935,6 +1296,9 @@ export class DocumentTool implements Tool {
     const renderedBody = useLlm
       ? await this.renderWithOpenAI(title, body, generationPrompt)
       : body;
+    const sections = normalizeSections(request, renderedBody);
+    const tables = normalizeTables(request);
+    const preview = extractTextPreviewFromSections(title, sections, renderedBody);
 
     if (request.action === "render_pdf") {
       const outputFilename = sanitizeFilenamePreserveExtension(
@@ -944,6 +1308,7 @@ export class DocumentTool implements Tool {
       const template = asString(request.input["template"], "default");
       const html = buildPdfHtml(title, renderedBody, template);
       const filePath = await this.renderPdf(request.taskId, outputFilename, html);
+      const artifactValidation = buildArtifactValidation(filePath, preview);
 
       return {
         status: "success",
@@ -952,7 +1317,8 @@ export class DocumentTool implements Tool {
         output: {
           filePath,
           outputFilename,
-          template
+          template,
+          artifactValidation
         },
         metrics: {
           durationMs: 10
@@ -960,13 +1326,94 @@ export class DocumentTool implements Tool {
       };
     }
 
+    if (request.action === "render_docx") {
+      const outputFilename = sanitizeFilenamePreserveExtension(
+        asString(request.input["outputFilename"], "report.docx"),
+        "report"
+      );
+      const filePath = await this.renderDocx(request.taskId, outputFilename, title, sections);
+      const artifactValidation = buildArtifactValidation(filePath, preview);
+
+      return {
+        status: "success",
+        summary: `Rendered DOCX document at ${filePath}`,
+        artifacts: [filePath],
+        output: {
+          filePath,
+          outputFilename,
+          artifactValidation
+        },
+        metrics: {
+          durationMs: 12
+        }
+      };
+    }
+
+    if (request.action === "render_pptx") {
+      const outputFilename = sanitizeFilenamePreserveExtension(
+        asString(request.input["outputFilename"], "brief.pptx"),
+        "brief"
+      );
+      const filePath = await this.renderPptx(request.taskId, outputFilename, title, sections);
+      const artifactValidation = buildArtifactValidation(filePath, preview);
+
+      return {
+        status: "success",
+        summary: `Rendered PPTX presentation at ${filePath}`,
+        artifacts: [filePath],
+        output: {
+          filePath,
+          outputFilename,
+          artifactValidation
+        },
+        metrics: {
+          durationMs: 12
+        }
+      };
+    }
+
+    if (request.action === "render_xlsx") {
+      const outputFilename = sanitizeFilenamePreserveExtension(
+        asString(request.input["outputFilename"], "dataset.xlsx"),
+        "dataset"
+      );
+      const filePath = await this.renderXlsx(
+        request.taskId,
+        outputFilename,
+        title,
+        sections,
+        tables
+      );
+      const artifactValidation = buildArtifactValidation(filePath, preview);
+
+      return {
+        status: "success",
+        summary: `Rendered XLSX workbook at ${filePath}`,
+        artifacts: [filePath],
+        output: {
+          filePath,
+          outputFilename,
+          artifactValidation
+        },
+        metrics: {
+          durationMs: 12
+        }
+      };
+    }
+
     const rendered = `# ${title}\n\n${renderedBody}\n`;
     const filePath = await this.workspaceManager.writeTaskFile(request.taskId, filename, rendered);
+    const artifactValidation = buildArtifactValidation(filePath, preview);
 
     return {
       status: "success",
       summary: `Rendered markdown document at ${filePath}`,
       artifacts: [filePath],
+      output: {
+        filePath,
+        outputFilename: filename,
+        artifactValidation
+      },
       metrics: {
         durationMs: 10
       }
@@ -1038,6 +1485,182 @@ export class DocumentTool implements Tool {
       await browser.close();
     }
   }
+
+  private async renderDocx(
+    taskId: string,
+    outputFilename: string,
+    title: string,
+    sections: NormalizedSection[]
+  ): Promise<string> {
+    const taskDir = await this.workspaceManager.ensureTaskWorkspace(taskId);
+    const filePath = path.join(taskDir, outputFilename);
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+
+    const children = [
+      new Paragraph({
+        text: title,
+        heading: HeadingLevel.TITLE
+      }),
+      ...sections.flatMap((section) => {
+        const paragraphs: Paragraph[] = [
+          new Paragraph({
+            text: section.heading,
+            heading: HeadingLevel.HEADING_1
+          })
+        ];
+        const bodyLines = section.body.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+        for (const line of bodyLines) {
+          if (line.startsWith("- ") || line.startsWith("* ")) {
+            paragraphs.push(
+              new Paragraph({
+                text: line.slice(2),
+                bullet: { level: 0 }
+              })
+            );
+          } else {
+            paragraphs.push(
+              new Paragraph({
+                children: [new TextRun(line)]
+              })
+            );
+          }
+        }
+        if (bodyLines.length === 0) {
+          paragraphs.push(new Paragraph(""));
+        }
+        return paragraphs;
+      })
+    ];
+
+    const document = new DocxDocument({
+      sections: [
+        {
+          children
+        }
+      ]
+    });
+    const buffer = await Packer.toBuffer(document);
+    await fs.writeFile(filePath, buffer);
+    return filePath;
+  }
+
+  private async renderPptx(
+    taskId: string,
+    outputFilename: string,
+    title: string,
+    sections: NormalizedSection[]
+  ): Promise<string> {
+    const taskDir = await this.workspaceManager.ensureTaskWorkspace(taskId);
+    const filePath = path.join(taskDir, outputFilename);
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+
+    const presentation = new PptxGenJS();
+    presentation.layout = "LAYOUT_WIDE";
+    presentation.author = "OpenClaw Local Manus";
+    presentation.subject = title;
+    presentation.title = title;
+
+    const titleSlide = presentation.addSlide();
+    titleSlide.addText(title, {
+      x: 0.5,
+      y: 0.6,
+      w: 12,
+      h: 0.8,
+      fontSize: 24,
+      bold: true,
+      color: "1f2933"
+    });
+    titleSlide.addText("Generated by OpenClaw Local Manus", {
+      x: 0.5,
+      y: 1.5,
+      w: 6,
+      h: 0.4,
+      fontSize: 11,
+      color: "52606d"
+    });
+
+    const normalizedSections = sections.length > 0 ? sections : [{ heading: "内容", body: "" }];
+    for (const section of normalizedSections) {
+      const slide = presentation.addSlide();
+      slide.addText(section.heading, {
+        x: 0.5,
+        y: 0.4,
+        w: 12,
+        h: 0.6,
+        fontSize: 20,
+        bold: true,
+        color: "102a43"
+      });
+      const bulletLines = section.body
+        .split(/\r?\n/)
+        .map((line) => line.replace(/^[-*]\s*/, "").trim())
+        .filter(Boolean)
+        .slice(0, 10);
+      slide.addText(
+        bulletLines.length > 0 ? bulletLines.map((line) => ({ text: line, options: { bullet: { indent: 18 } } })) : [{ text: "No additional content provided." }],
+        {
+          x: 0.8,
+          y: 1.3,
+          w: 11.2,
+          h: 5.4,
+          fontSize: 14,
+          color: "243b53",
+          breakLine: true,
+          valign: "top",
+          margin: 0.08
+        }
+      );
+    }
+
+    await presentation.writeFile({ fileName: filePath } as never);
+    return filePath;
+  }
+
+  private async renderXlsx(
+    taskId: string,
+    outputFilename: string,
+    title: string,
+    sections: NormalizedSection[],
+    tables: NormalizedTable[]
+  ): Promise<string> {
+    const taskDir = await this.workspaceManager.ensureTaskWorkspace(taskId);
+    const filePath = path.join(taskDir, outputFilename);
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+
+    const workbook = new ExcelJS.Workbook();
+    workbook.creator = "OpenClaw Local Manus";
+    workbook.subject = title;
+    workbook.title = title;
+
+    if (tables.length > 0) {
+      for (const table of tables) {
+        const worksheet = workbook.addWorksheet(
+          sanitizeFileToken(table.title).slice(0, 28) || "Table"
+        );
+        if (table.columns.length > 0) {
+          worksheet.addRow(table.columns);
+        }
+        for (const row of table.rows) {
+          worksheet.addRow(row);
+        }
+      }
+    } else {
+      const worksheet = workbook.addWorksheet("Report");
+      worksheet.addRow([title]);
+      worksheet.addRow([]);
+      for (const section of sections) {
+        worksheet.addRow([section.heading]);
+        for (const line of section.body.split(/\r?\n/).filter(Boolean)) {
+          worksheet.addRow([line.replace(/^[-*]\s*/, "").trim()]);
+        }
+        worksheet.addRow([]);
+      }
+    }
+
+    const buffer = await workbook.xlsx.writeBuffer();
+    await fs.writeFile(filePath, Buffer.from(buffer));
+    return filePath;
+  }
 }
 
 export class ActionTool implements Tool {
@@ -1046,7 +1669,15 @@ export class ActionTool implements Tool {
   constructor(private readonly options: ActionToolOptions) {}
 
   async execute(request: ToolRequest): Promise<ToolResponse> {
-    if (request.action !== "post_webhook") {
+    if (
+      ![
+        "post_webhook",
+        "send_webhook",
+        "send_email",
+        "send_slack",
+        "create_notion_page"
+      ].includes(request.action)
+    ) {
       return normalizeToolFailure(
         `Unsupported action tool action: ${request.action}`,
         ErrorCode.InvalidInput,
@@ -1054,6 +1685,22 @@ export class ActionTool implements Tool {
       );
     }
 
+    if (request.action === "send_email") {
+      return this.sendEmail(request);
+    }
+
+    if (request.action === "send_slack") {
+      return this.sendSlack(request);
+    }
+
+    if (request.action === "create_notion_page") {
+      return this.createNotionPage(request);
+    }
+
+    return this.sendWebhook(request);
+  }
+
+  private async sendWebhook(request: ToolRequest): Promise<ToolResponse> {
     const url = asString(request.input["url"], this.options.defaultUrl ?? "");
     if (!url) {
       return normalizeToolFailure(
@@ -1077,6 +1724,7 @@ export class ActionTool implements Tool {
         output: {
           url,
           method,
+          deliveryKind: "webhook",
           ...(payload === undefined ? {} : { payload })
         },
         metrics: {
@@ -1114,6 +1762,7 @@ export class ActionTool implements Tool {
         status: "success",
         summary: `Executed ${method} webhook call to ${url}`,
         output: {
+          deliveryKind: "webhook",
           url,
           method,
           statusCode: response.status,
@@ -1137,6 +1786,267 @@ export class ActionTool implements Tool {
     } finally {
       clearTimeout(timeout);
     }
+  }
+
+  private async sendEmail(request: ToolRequest): Promise<ToolResponse> {
+    const smtp = this.options.smtp ?? {};
+    const to = asString(request.input["to"]);
+    const subject = asString(request.input["subject"], "OpenClaw Local Manus notification");
+    const text = asString(request.input["text"], asString(request.input["body"]));
+    const html = asString(request.input["html"]);
+
+    if (!to) {
+      return normalizeToolFailure(
+        "Action tool requires an email recipient",
+        ErrorCode.InvalidInput,
+        false
+      );
+    }
+
+    if (this.options.mode !== "live" || request.input["dryRun"] === true) {
+      return {
+        status: "success",
+        summary: `Prepared mock email to ${to}`,
+        output: {
+          deliveryKind: "email",
+          to,
+          subject
+        },
+        metrics: {
+          durationMs: 5
+        }
+      };
+    }
+
+    if (!smtp.host || !smtp.port || !smtp.from) {
+      return normalizeToolFailure(
+        "SMTP configuration is incomplete for send_email",
+        ErrorCode.InvalidInput,
+        false
+      );
+    }
+
+    try {
+      const startedAt = Date.now();
+      const transport = nodemailer.createTransport({
+        host: smtp.host,
+        port: smtp.port,
+        secure: smtp.secure ?? false,
+        ...(smtp.user && smtp.pass
+          ? {
+              auth: {
+                user: smtp.user,
+                pass: smtp.pass
+              }
+            }
+          : {})
+      });
+      const receipt = await transport.sendMail({
+        from: smtp.from,
+        to,
+        subject,
+        text: text || stripMarkdownFormatting(html),
+        ...(html ? { html } : {})
+      });
+
+      return {
+        status: "success",
+        summary: `Sent email to ${to}`,
+        output: {
+          deliveryKind: "email",
+          to,
+          subject,
+          messageId: receipt.messageId,
+          accepted: receipt.accepted.map((entry) =>
+            typeof entry === "string" ? entry : entry.address ?? String(entry)
+          )
+        },
+        metrics: {
+          durationMs: Date.now() - startedAt
+        }
+      };
+    } catch (error: unknown) {
+      return normalizeToolFailure(
+        `Email delivery failed: ${error instanceof Error ? error.message : String(error)}`,
+        ErrorCode.NetworkError,
+        true
+      );
+    }
+  }
+
+  private async sendSlack(request: ToolRequest): Promise<ToolResponse> {
+    const url = asString(request.input["url"], this.options.slackWebhookUrl ?? "");
+    const text = asString(request.input["text"], asString(request.input["body"]));
+    const blocks = request.input["blocks"];
+
+    if (!url) {
+      return normalizeToolFailure(
+        "Slack webhook url is required",
+        ErrorCode.InvalidInput,
+        false
+      );
+    }
+
+    if (this.options.mode !== "live" || request.input["dryRun"] === true) {
+      return {
+        status: "success",
+        summary: `Prepared mock Slack notification`,
+        output: {
+          deliveryKind: "slack",
+          url,
+          text
+        },
+        metrics: {
+          durationMs: 5
+        }
+      };
+    }
+
+    const startedAt = Date.now();
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        text,
+        ...(Array.isArray(blocks) ? { blocks } : {})
+      })
+    });
+    const responseText = trimText(await response.text(), 4_000);
+    if (!response.ok) {
+      return normalizeToolFailure(
+        `Slack webhook returned HTTP ${response.status}: ${responseText}`,
+        ErrorCode.NetworkError,
+        true
+      );
+    }
+
+    return {
+      status: "success",
+      summary: "Sent Slack notification",
+      output: {
+        deliveryKind: "slack",
+        statusCode: response.status,
+        responseBody: responseText
+      },
+      metrics: {
+        durationMs: Date.now() - startedAt
+      }
+    };
+  }
+
+  private async createNotionPage(request: ToolRequest): Promise<ToolResponse> {
+    const notionToken = this.options.notionToken;
+    const parentPageId = asString(
+      request.input["parentPageId"],
+      this.options.notionParentPageId ?? ""
+    );
+    const title = asString(request.input["title"], "OpenClaw Local Manus");
+    const body = asString(request.input["body"], asString(request.input["text"]));
+
+    if (!parentPageId) {
+      return normalizeToolFailure(
+        "Notion parent page id is required",
+        ErrorCode.InvalidInput,
+        false
+      );
+    }
+
+    if (this.options.mode !== "live" || request.input["dryRun"] === true) {
+      return {
+        status: "success",
+        summary: `Prepared mock Notion page creation`,
+        output: {
+          deliveryKind: "notion",
+          parentPageId,
+          title
+        },
+        metrics: {
+          durationMs: 5
+        }
+      };
+    }
+
+    if (!notionToken) {
+      return normalizeToolFailure(
+        "Notion token is required",
+        ErrorCode.InvalidInput,
+        false
+      );
+    }
+
+    const paragraphBlocks = splitMarkdownSections(body)
+      .flatMap((section) => [section.heading, section.body].filter(Boolean))
+      .map((content) => stripMarkdownFormatting(content))
+      .filter(Boolean)
+      .slice(0, 50)
+      .map((content) => ({
+        object: "block",
+        type: "paragraph",
+        paragraph: {
+          rich_text: [
+            {
+              type: "text",
+              text: {
+                content
+              }
+            }
+          ]
+        }
+      }));
+
+    const startedAt = Date.now();
+    const response = await fetch("https://api.notion.com/v1/pages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${notionToken}`,
+        "content-type": "application/json",
+        "notion-version": "2022-06-28"
+      },
+      body: JSON.stringify({
+        parent: {
+          type: "page_id",
+          page_id: parentPageId
+        },
+        properties: {
+          title: {
+            title: [
+              {
+                text: {
+                  content: title
+                }
+              }
+            ]
+          }
+        },
+        children: paragraphBlocks
+      })
+    });
+
+    const responseText = trimText(await response.text(), 4_000);
+    if (!response.ok) {
+      return normalizeToolFailure(
+        `Notion API returned HTTP ${response.status}: ${responseText}`,
+        ErrorCode.NetworkError,
+        true
+      );
+    }
+
+    const payload = JSON.parse(responseText) as Record<string, unknown>;
+    return {
+      status: "success",
+      summary: `Created Notion page ${title}`,
+      output: {
+        deliveryKind: "notion",
+        pageId: asString(payload["id"]),
+        url: asString(payload["url"]),
+        title
+      },
+      metrics: {
+        durationMs: Date.now() - startedAt
+      }
+    };
   }
 }
 

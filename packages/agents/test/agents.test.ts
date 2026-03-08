@@ -4,6 +4,7 @@ import {
   AgentKind,
   ErrorCode,
   StepStatus,
+  TaskClass,
   TaskStatus,
   ToolName,
   UserProfile
@@ -336,6 +337,22 @@ test("planner inserts a document step before pdf export when the goal requires m
   assert.deepEqual(plan.steps[2]?.dependsOn, [plan.steps[1]?.id]);
 });
 
+test("planner mock path preserves coding -> document -> pdf order for uploaded csv markdown pdf goals", async () => {
+  const planner = new PlannerAgent(new ModelRouter(), undefined, "mock");
+  const plan = await planner.createPlan(
+    "读取上传的 CSV，输出关键发现、markdown 摘要并导出 PDF",
+    { recipeId: "dataset_analysis" }
+  );
+
+  assert.deepEqual(
+    plan.steps.map((step) => step.agent),
+    [AgentKind.Coding, AgentKind.Document, AgentKind.Coding]
+  );
+  assert.equal(plan.steps[0]?.dependsOn.length, 0);
+  assert.deepEqual(plan.steps[1]?.dependsOn, [plan.steps[0]?.id]);
+  assert.deepEqual(plan.steps[2]?.dependsOn, [plan.steps[1]?.id]);
+});
+
 test("browser agent falls back to the next candidate when the first page is blocked", async () => {
   const attempts: string[] = [];
   const toolRuntime = {
@@ -394,6 +411,67 @@ test("browser agent falls back to the next candidate when the first page is bloc
   assert.equal(response.structuredData?.currentUrl, "https://success.example");
   assert.equal(response.artifacts?.[0], "/tmp/success.png");
   assert.ok(Array.isArray(response.structuredData?.attemptSummaries));
+});
+
+test("browser agent falls back to the next candidate when the first page is low-substance", async () => {
+  const attempts: string[] = [];
+  const toolRuntime = {
+    execute: async (request: {
+      input: Record<string, unknown>;
+      toolName: ToolName;
+      stepId: string;
+      taskId: string;
+      action: string;
+      callerAgent: AgentKind;
+    }) => {
+      const url = String(request.input.url ?? "");
+      attempts.push(url);
+
+      if (url.includes("404.example")) {
+        return {
+          status: "success" as const,
+          summary: `Extracted browser content from ${url}`,
+          output: {
+            currentUrl: url,
+            pageTitle: "404 - File or directory not found.",
+            extractedText:
+              "The resource you are looking for might have been removed, had its name changed, or is temporarily unavailable."
+          },
+          artifacts: ["/tmp/404.png"]
+        };
+      }
+
+      return {
+        status: "success" as const,
+        summary: `Extracted browser content from ${url}`,
+        output: {
+          currentUrl: url,
+          pageTitle: "Dubai Manufacturing Guidance",
+          extractedText:
+            "Industrial licensing, cosmetics registration, fire safety approvals, and customs duties are required."
+        },
+        artifacts: ["/tmp/success.png"]
+      };
+    }
+  } as unknown as ToolRuntime;
+
+  const agent = new BrowserAgent(toolRuntime, new ModelRouter(), undefined, "mock");
+  const response = await agent.execute({
+    taskId: "task_browser_404",
+    stepId: "s2",
+    goal: "调研在阿联酋开设香水制造公司的可行性",
+    context: {
+      topResultUrl: "https://404.example",
+      browserCandidateUrls: ["https://404.example", "https://success.example"]
+    },
+    successCriteria: [],
+    artifacts: []
+  });
+
+  assert.equal(response.status, "success");
+  assert.deepEqual(attempts, ["https://404.example", "https://success.example"]);
+  assert.equal(response.structuredData?.currentUrl, "https://success.example");
+  assert.equal(response.artifacts?.[0], "/tmp/success.png");
 });
 
 test("browser agent bootstraps candidate urls with search when none are provided", async () => {
@@ -769,7 +847,59 @@ test("research agent recovers from malformed synthesis json in live mode", async
   assert.deepEqual(response.structuredData?.marketSignals, ["Airport demand is rising"]);
 });
 
-test("research agent returns retryable failure when malformed synthesis json recovery fails", async () => {
+test("research agent normalizes nested list-like fields during malformed synthesis recovery", async () => {
+  const toolRuntime = {
+    execute: async () => ({
+      status: "success" as const,
+      summary: "Collected market sources",
+      output: {
+        answer: "Collected live research notes.",
+        results: [{ url: "https://source.example", title: "Source", snippet: "Airport demand remains strong." }]
+      }
+    })
+  } as unknown as ToolRuntime;
+  const llmClient = {
+    isConfigured: () => true,
+    generateJson: async () => {
+      throw new Error("Unterminated string in JSON at position 42");
+    },
+    generateText: async () => ({
+      id: "resp_recovery_nested_fields",
+      model: "gpt-5-mini-2025-08-07",
+      outputText: `{
+  "summary":"Recovered synthesis",
+  "topResultUrl":"https://source.example",
+  "findings":[{"text":"Regulatory scope spans cosmetics and related imports."}],
+  "marketSignals":{"primary":"Airport demand is rising","secondary":["Luxury gifting","Tourism traffic"]},
+  "coverageGaps":{"items":["Need current free-zone fee quotes"]}
+}`,
+      raw: {}
+    })
+  } as const;
+
+  const agent = new ResearchAgent(toolRuntime, new ModelRouter(), llmClient as never, "live");
+  const response = await agent.execute({
+    taskId: "task_research_nested_recovery",
+    stepId: "s1",
+    goal: "调研迪拜新能源租车市场",
+    context: {},
+    successCriteria: [],
+    artifacts: []
+  });
+
+  assert.equal(response.status, "success");
+  assert.deepEqual(response.structuredData?.findings, [
+    "Regulatory scope spans cosmetics and related imports."
+  ]);
+  assert.deepEqual(response.structuredData?.marketSignals, [
+    "Airport demand is rising",
+    "Luxury gifting",
+    "Tourism traffic"
+  ]);
+  assert.deepEqual(response.structuredData?.coverageGaps, ["Need current free-zone fee quotes"]);
+});
+
+test("research agent falls back to rule-based synthesis when malformed recovery lacks schema fields", async () => {
   let recoveryCalled = 0;
   const toolRuntime = {
     execute: async () => ({
@@ -808,14 +938,73 @@ test("research agent returns retryable failure when malformed synthesis json rec
   });
 
   assert.equal(recoveryCalled, 1);
-  assert.equal(response.status, "failed");
-  assert.equal(response.summary, "research synthesis failed");
-  assert.equal(response.structuredData?.stage, "research");
-  assert.equal(response.error?.retryable, true);
+  assert.equal(response.status, "success");
+  assert.equal(response.structuredData?.synthesisFallbackUsed, true);
   assert.match(
-    String(response.error?.message),
-    /Unterminated string in JSON at position 42.*recovery_failed/
+    String(response.structuredData?.synthesisFallbackReason ?? ""),
+    /research_json_recovery_failed/
   );
+  assert.ok(Array.isArray(response.structuredData?.findings));
+  assert.ok((response.structuredData?.findings as string[]).length > 0);
+});
+
+test("research agent falls back to rule-based synthesis when json recovery remains unusable", async () => {
+  let recoveryCalled = 0;
+  const toolRuntime = {
+    execute: async () => ({
+      status: "success" as const,
+      summary: "Collected market sources",
+      output: {
+        answer:
+          "MOHAP registration applies to cosmetics sold in the UAE. Free-zone incorporation often reduces setup friction.",
+        results: [
+          {
+            url: "https://u.ae/example",
+            title: "UAE customs and import guidance",
+            snippet: "Federal guidance covers customs, import and compliance requirements."
+          },
+          {
+            url: "https://freezone.example",
+            title: "Free zone setup guide",
+            snippet: "Free-zone structures can streamline setup and visa sponsorship."
+          }
+        ]
+      }
+    })
+  } as unknown as ToolRuntime;
+  const llmClient = {
+    isConfigured: () => true,
+    generateJson: async () => {
+      throw new Error("Unterminated string in JSON at position 42");
+    },
+    generateText: async () => {
+      recoveryCalled += 1;
+      return {
+        id: "resp_recovery_unusable",
+        model: "gpt-5-mini-2025-08-07",
+        outputText: "not valid json at all",
+        raw: {}
+      };
+    }
+  } as const;
+
+  const agent = new ResearchAgent(toolRuntime, new ModelRouter(), llmClient as never, "live");
+  const response = await agent.execute({
+    taskId: "task_research_rule_fallback",
+    stepId: "s1",
+    goal: "调研在阿联酋开设香水制造公司的可行性与落地路径",
+    context: {},
+    successCriteria: [],
+    artifacts: []
+  });
+
+  assert.equal(recoveryCalled, 1);
+  assert.equal(response.status, "success");
+  assert.equal(response.structuredData?.synthesisFallbackUsed, true);
+  assert.match(String(response.structuredData?.synthesisFallbackReason ?? ""), /research_json_recovery_failed/);
+  assert.equal(response.structuredData?.topResultUrl, "https://u.ae/example");
+  assert.ok(Array.isArray(response.structuredData?.findings));
+  assert.ok((response.structuredData?.findings as string[]).length > 0);
 });
 
 test("research agent rejects zero-source output in live mode after successful synthesis", async () => {
@@ -1118,6 +1307,162 @@ test("verifier accepts pdf export steps when pdf artifact and preview evidence a
   assert.equal(Array.isArray(decision.missingCriteria), true);
 });
 
+test("verifier allows browser steps to reuse prior timeline evidence", async () => {
+  const verifier = new VerifierAgent(new ModelRouter(), undefined, "mock");
+
+  const decision = await verifier.verifyStep(
+    {
+      id: "task_browser_timeline_reuse",
+      userId: "tester",
+      goal: "TASK: 做一个关于伊朗战争的最新简报带时间轴",
+      status: TaskStatus.Running,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      currentPlanVersion: 1,
+      plan: {
+        goal: "TASK: 做一个关于伊朗战争的最新简报带时间轴",
+        assumptions: [],
+        steps: [],
+        taskSuccessCriteria: ["生成带时间轴的简报"]
+      },
+      steps: [
+        {
+          id: "step1",
+          title: "收集时间轴",
+          agent: AgentKind.Research,
+          objective: "先收集上游研究时间线",
+          dependsOn: [],
+          status: StepStatus.Completed,
+          retryCount: 0,
+          successCriteria: [],
+          inputArtifacts: [],
+          outputArtifacts: [],
+          structuredData: {
+            timelineEvents: [
+              {
+                date: "2026-03-01",
+                event: "event",
+                sourceUrl: "https://example.com/source"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      id: "step2",
+      title: "Inspect source evidence",
+      agent: AgentKind.Browser,
+      objective: "Inspect candidate web pages for the latest conflict evidence",
+      dependsOn: ["step1"],
+      status: StepStatus.Running,
+      retryCount: 0,
+      successCriteria: ["A page was extracted"],
+      inputArtifacts: [],
+      outputArtifacts: [],
+      structuredData: {}
+    },
+    {
+      status: "success",
+      summary: "Inspected follow-up sources",
+      artifacts: ["/tmp/page.png"],
+      structuredData: {
+        sources: [
+          {
+            title: "Example source",
+            url: "https://example.com/source",
+            snippet: "updated evidence",
+            tier: "tier1"
+          },
+          {
+            title: "Second source",
+            url: "https://example.com/source-2",
+            snippet: "additional evidence",
+            tier: "tier2"
+          },
+          {
+            title: "Third source",
+            url: "https://example.com/source-3",
+            snippet: "supporting evidence",
+            tier: "tier2"
+          }
+        ],
+        extractedFacts: ["An updated fact from the browser step."],
+        sourceUrls: [
+          "https://example.com/source",
+          "https://example.com/source-2",
+          "https://example.com/source-3"
+        ]
+      }
+    }
+  );
+
+  assert.equal(decision.verdict, "pass");
+  assert.ok(!(decision.qualityDefects ?? []).includes("timeline evidence missing"));
+});
+
+test("verifier only requires timeline events when the quality profile explicitly asks for them", async () => {
+  const verifier = new VerifierAgent(new ModelRouter(), undefined, "mock");
+
+  const decision = await verifier.verifyStep(
+    {
+      id: "task_feasibility_verifier",
+      userId: "tester",
+      goal: "TASK: 调研在阿联酋开设香水制造公司的可行性与落地路径，输出可执行报告。要求包含监管、设立路径、成本模型、供应链、渠道、时间线、风险与来源。",
+      status: TaskStatus.Running,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      currentPlanVersion: 1,
+      plan: {
+        goal: "TASK: 调研在阿联酋开设香水制造公司的可行性与落地路径，输出可执行报告。要求包含监管、设立路径、成本模型、供应链、渠道、时间线、风险与来源。",
+        assumptions: [],
+        steps: [],
+        taskSuccessCriteria: ["生成报告"]
+      },
+      steps: []
+    },
+    {
+      id: "s1",
+      title: "Research source-backed information",
+      agent: AgentKind.Research,
+      objective: "Collect source-backed feasibility evidence",
+      dependsOn: [],
+      status: StepStatus.Running,
+      retryCount: 0,
+      successCriteria: ["At least one relevant source found"],
+      inputArtifacts: [],
+      outputArtifacts: [],
+      structuredData: {},
+      taskClass: TaskClass.ResearchBrowser,
+      qualityProfile: {
+        requiredEvidence: ["sources", "findings"],
+        minSourceCount: 4,
+        requireOutputReadable: true,
+        requireSchemaValid: true
+      }
+    },
+    {
+      status: "success",
+      summary: "Collected feasibility evidence",
+      artifacts: [],
+      structuredData: {
+        sources: [
+          "https://example.com/source-1",
+          "https://example.com/source-2",
+          "https://example.com/source-3",
+          "https://example.com/source-4"
+        ],
+        sourceCount: 4,
+        findings: ["监管要求", "设立路径", "成本模型"]
+      }
+    }
+  );
+
+  assert.equal(decision.verdict, "pass");
+  assert.ok(!(decision.qualityDefects ?? []).includes("timeline evidence missing"));
+  assert.ok(!(decision.missingEvidence ?? []).includes("timelineEvents"));
+});
+
 test("coding agent falls back to local python draft on quota-style llm failure", async () => {
   let pythonCalled = false;
   const toolRuntime = {
@@ -1406,6 +1751,65 @@ test("coding agent does not treat non-export steps as pdf export just because th
       uploadedArtifactUris: ["/tmp/uploads/numbers.csv"]
     },
     successCriteria: ["CSV 文件被成功读取。", "输出包含基础数据概览。"],
+    artifacts: []
+  });
+
+  assert.equal(renderPdfCalled, false);
+  assert.equal(pythonCalled, true);
+  assert.equal(response.status, "success");
+});
+
+test("coding agent does not treat analysis steps as pdf export when the step objective echoes the full goal", async () => {
+  let renderPdfCalled = false;
+  let pythonCalled = false;
+  const toolRuntime = {
+    execute: async (request: {
+      action: string;
+      input: Record<string, unknown>;
+      inputFiles?: string[];
+    }) => {
+      if (request.action === "render_pdf") {
+        renderPdfCalled = true;
+        return {
+          status: "success" as const,
+          summary: "Rendered PDF",
+          artifacts: ["/tmp/brief.pdf"]
+        };
+      }
+
+      pythonCalled = true;
+      return {
+        status: "success" as const,
+        summary: "Executed python script",
+        artifacts: ["/tmp/coding-output.json", "/tmp/coding-output.md"],
+        output: {
+          stdout: "{\"status\":\"ok\"}",
+          stderr: "",
+          generatedFiles: ["/tmp/coding-output.json", "/tmp/coding-output.md"],
+          scriptPath: "/tmp/step1.py",
+          inputFiles: ["/tmp/inputs/sample-sales.csv"]
+        }
+      };
+    }
+  } as unknown as ToolRuntime;
+
+  const agent = new CodingAgent(toolRuntime, new ModelRouter(), undefined, "mock");
+  const response = await agent.execute({
+    taskId: "task_non_pdf_goal_echo",
+    stepId: "s1",
+    goal: "读取上传的 CSV，输出关键发现、markdown 摘要并导出 PDF",
+    context: {
+      currentStep: {
+        id: "s1",
+        title: "Run local Python analysis",
+        objective: "Use Python in the local sandbox to produce structured results for: 读取上传的 CSV，输出关键发现、markdown 摘要并导出 PDF"
+      },
+      uploadedArtifactUris: ["/tmp/uploads/sample-sales.csv"]
+    },
+    successCriteria: [
+      "A Python artifact exists",
+      "The sandbox produced at least one useful output file"
+    ],
     artifacts: []
   });
 

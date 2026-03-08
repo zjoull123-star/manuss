@@ -53,6 +53,12 @@
               >用 Python 分析 12, 18, 25, 40 这四个数字，输出 JSON 和 markdown 摘要</textarea>
             </label>
             <label>
+              <span>Recipe（可选）</span>
+              <select id="recipe-id" name="recipeId">
+                <option value="">自动匹配</option>
+              </select>
+            </label>
+            <label>
               <span>创建时附件（可选）</span>
               <input id="create-upload-input" name="createUploads" type="file" multiple />
             </label>
@@ -70,6 +76,17 @@
             <span class="pill" id="task-count">0</span>
           </div>
           <div class="task-list" id="task-list"></div>
+          <div class="detail-section">
+            <h3>质量指标</h3>
+            <div class="event-list" id="quality-metrics"></div>
+          </div>
+          <div class="detail-section">
+            <div class="panel-head">
+              <h3>基准运行</h3>
+              <button id="run-smoke-benchmark" type="button" class="ghost">跑 Smoke</button>
+            </div>
+            <div class="event-list" id="benchmark-runs"></div>
+          </div>
         </section>
 
         <section class="panel panel-detail">
@@ -106,6 +123,17 @@
               <div class="artifact-list" id="final-artifact-panel"></div>
             </div>
 
+            <div class="detail-section split">
+              <div>
+                <h3>最终校验</h3>
+                <div class="artifact-list" id="final-validation-panel"></div>
+              </div>
+              <div>
+                <h3>引用与复用</h3>
+                <div class="artifact-list" id="reference-list"></div>
+              </div>
+            </div>
+
             <div class="detail-section">
               <h3>步骤</h3>
               <div class="step-timeline" id="step-timeline"></div>
@@ -129,9 +157,14 @@
                 <div class="artifact-list" id="artifact-list"></div>
               </div>
               <div>
-                <h3>工具调用</h3>
-                <div class="tool-call-list" id="tool-call-list"></div>
+                <h3>已索引产物</h3>
+                <div class="tool-call-list" id="indexed-artifact-list"></div>
               </div>
+            </div>
+
+            <div class="detail-section">
+              <h3>工具调用</h3>
+              <div class="tool-call-list" id="tool-call-list"></div>
             </div>
 
             <div class="detail-section">

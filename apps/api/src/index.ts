@@ -5,6 +5,7 @@ import {
   ApprovalStatus,
   Artifact,
   ArtifactType,
+  BenchmarkRunStatus,
   createTaskEvent,
   createTaskJob,
   TaskEventKind,
@@ -15,7 +16,9 @@ import {
 import { DEFAULT_OPENAI_MODELS } from "../../../packages/llm/src";
 import { buildDemoRuntime } from "../../../packages/orchestrator/src";
 import { ConsoleLogger } from "../../../packages/observability/src";
-import { createId } from "../../../packages/shared/src";
+import { createId, JsonObject } from "../../../packages/shared/src";
+import { getRecipeById, listRecipes, matchRecipeForGoal } from "../../../packages/recipes/src";
+import { listBenchmarkCases, runBenchmarkSuite } from "../../../packages/evals/src";
 
 const port = Number(process.env.PORT ?? 3000);
 const host = process.env.HOST ?? "127.0.0.1";
@@ -103,6 +106,10 @@ const getContentType = (filePath: string): string => {
       return "application/json; charset=utf-8";
     case ".md":
       return "text/markdown; charset=utf-8";
+    case ".docx":
+      return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+    case ".pptx":
+      return "application/vnd.openxmlformats-officedocument.presentationml.presentation";
     case ".xlsx":
       return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
     case ".xls":
@@ -140,10 +147,12 @@ const summarizeTask = (task: {
   id: string;
   userId?: string;
   goal?: string;
+  recipeId?: string;
   status: string;
   createdAt?: string;
   updatedAt?: string;
   finalArtifactUri?: string;
+  finalArtifactValidation?: unknown;
   origin?: TaskOrigin;
   retryOfTaskId?: string;
   cancelRequestedAt?: string;
@@ -151,10 +160,12 @@ const summarizeTask = (task: {
   id: task.id,
   ...(task.userId ? { userId: task.userId } : {}),
   ...(task.goal ? { goal: task.goal } : {}),
+  ...(task.recipeId ? { recipeId: task.recipeId } : {}),
   status: task.status,
   ...(task.createdAt ? { createdAt: task.createdAt } : {}),
   ...(task.updatedAt ? { updatedAt: task.updatedAt } : {}),
   finalArtifactUri: task.finalArtifactUri ?? null,
+  finalArtifactValidation: task.finalArtifactValidation ?? null,
   origin: task.origin ?? null,
   retryOfTaskId: task.retryOfTaskId ?? null,
   cancelRequestedAt: task.cancelRequestedAt ?? null
@@ -297,6 +308,12 @@ const inferArtifactTypeFromFile = (filePath: string): ArtifactType => {
   if (extension === ".pdf") {
     return ArtifactType.Pdf;
   }
+  if (extension === ".docx") {
+    return ArtifactType.Document;
+  }
+  if (extension === ".pptx") {
+    return ArtifactType.Presentation;
+  }
   if (extension === ".md") {
     return ArtifactType.Markdown;
   }
@@ -325,6 +342,11 @@ const decorateArtifactForApi = (taskId: string, artifact: Artifact) => {
 
   return {
     ...artifact,
+    title: artifact.title ?? null,
+    summary: artifact.summary ?? null,
+    keywords: artifact.keywords ?? [],
+    validated: typeof artifact.validated === "boolean" ? artifact.validated : null,
+    deliveryKind: artifact.deliveryKind ?? null,
     name: originalFilename ?? path.basename(uri) ?? null,
     originalFilename,
     uploaded: metadata["uploaded"] === true,
@@ -400,6 +422,10 @@ const buildTaskBundle = async (taskId: string): Promise<Record<string, unknown> 
     runtime.checkpointRepository.getLatest(taskId),
     runtime.taskEventRepository.listByTask(taskId, 500)
   ]);
+  const [references, indexedArtifacts] = await Promise.all([
+    runtime.taskReferenceRepository.listByTask(taskId),
+    runtime.artifactIndexRepository.listByTask(taskId)
+  ]);
 
   return {
     task: summarizeTaskForApi({
@@ -413,7 +439,40 @@ const buildTaskBundle = async (taskId: string): Promise<Record<string, unknown> 
     jobs,
     toolCalls,
     events,
+    references,
+    finalArtifactValidation: task.finalArtifactValidation ?? null,
+    indexedArtifacts,
     checkpoint: checkpoint ?? null
+  };
+};
+
+const buildQualityMetrics = async (): Promise<Record<string, unknown>> => {
+  const tasks = await runtime.taskRepository.listRecent(200);
+  const grouped = new Map<string, { total: number; completed: number; failed: number; fallbackUsed: number }>();
+  for (const task of tasks) {
+    for (const step of task.steps) {
+      const taskClass = step.taskClass ?? "unknown";
+      const entry = grouped.get(taskClass) ?? { total: 0, completed: 0, failed: 0, fallbackUsed: 0 };
+      entry.total += 1;
+      if (step.status === "COMPLETED") {
+        entry.completed += 1;
+      }
+      if (step.status === "FAILED") {
+        entry.failed += 1;
+      }
+      if (step.error?.fallbackUsed === true || step.structuredData?.llmFallbackUsed === true || step.structuredData?.synthesisFallbackUsed === true) {
+        entry.fallbackUsed += 1;
+      }
+      grouped.set(taskClass, entry);
+    }
+  }
+
+  return {
+    taskClasses: [...grouped.entries()].map(([taskClass, metrics]) => ({
+      taskClass,
+      ...metrics,
+      completionRate: metrics.total > 0 ? metrics.completed / metrics.total : 0
+    }))
   };
 };
 
@@ -568,6 +627,34 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
+    if (request.method === "GET" && pathname === "/recipes") {
+      sendJson(response, 200, {
+        recipes: listRecipes()
+      });
+      return;
+    }
+
+    if (request.method === "GET" && pathname === "/metrics/quality") {
+      sendJson(response, 200, await buildQualityMetrics());
+      return;
+    }
+
+    if (request.method === "GET" && pathname === "/artifacts/search") {
+      const q = url.searchParams.get("q") ?? undefined;
+      const taskClass = url.searchParams.get("taskClass") ?? undefined;
+      const artifactType = url.searchParams.get("artifactType") ?? undefined;
+      const limit = asPositiveInt(url.searchParams.get("limit"), 20);
+      const results = await runtime.artifactIndexRepository.search({
+        ...(q ? { q } : {}),
+        ...(taskClass ? { taskClass } : {}),
+        ...(artifactType ? { artifactType } : {}),
+        validatedOnly: url.searchParams.get("validatedOnly") !== "0",
+        limit
+      });
+      sendJson(response, 200, { artifacts: results });
+      return;
+    }
+
     if (request.method === "GET" && pathname === "/tasks") {
       const limit = asPositiveInt(url.searchParams.get("limit"), 30);
       const tasks = await runtime.taskRepository.listRecent(limit);
@@ -588,6 +675,14 @@ const server = http.createServer(async (request, response) => {
           ? body["goal"]
           : undefined;
       const deferStart = body["deferStart"] === true;
+      const recipeId =
+        typeof body["recipeId"] === "string" && body["recipeId"].length > 0
+          ? body["recipeId"]
+          : matchRecipeForGoal(goal ?? "")?.id;
+      if (recipeId && !getRecipeById(recipeId)) {
+        sendJson(response, 400, { error: `Unknown recipeId: ${recipeId}` });
+        return;
+      }
       let origin: TaskOrigin | undefined;
       try {
         origin = parseTaskOrigin(body["origin"]);
@@ -619,6 +714,7 @@ const server = http.createServer(async (request, response) => {
       const task = await runtime.orchestrator.createDraftTask({
         userId,
         goal,
+        ...(recipeId ? { recipeId } : {}),
         ...(origin ? { origin } : {})
       });
       if (deferStart) {
@@ -695,6 +791,19 @@ const server = http.createServer(async (request, response) => {
       }
 
       sendJson(response, 200, bundle);
+      return;
+    }
+
+    const taskReferencesMatch = pathname.match(/^\/tasks\/([^/]+)\/references$/);
+    const referenceTaskId = taskReferencesMatch?.[1];
+    if (request.method === "GET" && referenceTaskId) {
+      const task = await runtime.taskRepository.getById(referenceTaskId);
+      if (!task) {
+        sendJson(response, 404, { error: "Task not found" });
+        return;
+      }
+      const references = await runtime.taskReferenceRepository.listByTask(referenceTaskId);
+      sendJson(response, 200, { references });
       return;
     }
 
@@ -857,6 +966,69 @@ const server = http.createServer(async (request, response) => {
         return;
       }
       sendJson(response, 200, { job });
+      return;
+    }
+
+    if (request.method === "GET" && pathname === "/benchmarks/runs") {
+      const runs = await runtime.benchmarkRunRepository.listRecent(asPositiveInt(url.searchParams.get("limit"), 20));
+      const items = await Promise.all(
+        runs.map(async (run) => ({
+          ...run,
+          items: await runtime.benchmarkRunItemRepository.listByRun(run.id)
+        }))
+      );
+      sendJson(response, 200, { runs: items });
+      return;
+    }
+
+    if (request.method === "GET" && pathname === "/benchmarks/cases") {
+      sendJson(response, 200, { cases: listBenchmarkCases() });
+      return;
+    }
+
+    if (request.method === "POST" && pathname === "/benchmarks/runs") {
+      const body = await readJsonBody(request);
+      const name =
+        typeof body["name"] === "string" && body["name"].length > 0
+          ? body["name"]
+          : "manual benchmark";
+      const suite =
+        typeof body["suite"] === "string" && body["suite"].length > 0
+          ? body["suite"]
+          : "manual";
+      const caseIds = Array.isArray(body["caseIds"])
+        ? body["caseIds"].filter((item): item is string => typeof item === "string" && item.length > 0)
+        : undefined;
+      const run = await runtime.benchmarkRunRepository.create({
+        id: createId("bench"),
+        name,
+        suite,
+        status: BenchmarkRunStatus.Pending,
+        startedAt: new Date().toISOString(),
+        createdAt: new Date().toISOString(),
+        metadata: JSON.parse(JSON.stringify(body)) as JsonObject
+      });
+      void runBenchmarkSuite(runtime, {
+        run,
+        name,
+        suite,
+        ...(caseIds ? { caseIds } : {})
+      }).catch(async (error: unknown) => {
+        const currentRun = await runtime.benchmarkRunRepository.getById(run.id);
+        if (!currentRun) {
+          return;
+        }
+        await runtime.benchmarkRunRepository.update({
+          ...currentRun,
+          status: BenchmarkRunStatus.Failed,
+          completedAt: new Date().toISOString(),
+          metadata: {
+            ...currentRun.metadata,
+            error: error instanceof Error ? error.message : String(error)
+          }
+        });
+      });
+      sendJson(response, 201, { run });
       return;
     }
 
