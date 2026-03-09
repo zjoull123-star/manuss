@@ -1,9 +1,19 @@
+import path from "node:path";
 import { buildOriginFromCommandContext } from "./origin.js";
 
 function renderTaskSummary(task) {
   const lines = [`任务 ${task.id}`, `状态: ${task.status}`];
+  if (task.stageLabel) {
+    lines.push(`阶段: ${task.stageLabel}`);
+  }
+  if (task.stageSummary) {
+    lines.push(`摘要: ${task.stageSummary}`);
+  }
+  if (task.failureCategory) {
+    lines.push(`失败类别: ${task.failureCategory}`);
+  }
   if (task.finalArtifactUri) {
-    lines.push(`产物: ${task.finalArtifactUri}`);
+    lines.push(`产物: ${path.basename(task.finalArtifactUri)}`);
   }
   return lines.join("\n");
 }

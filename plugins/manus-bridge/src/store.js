@@ -39,6 +39,7 @@ export class ManusBridgeStore {
       origin,
       conversationKey,
       lastStatus: existing.lastStatus ?? null,
+      lastStageKey: existing.lastStageKey ?? null,
       lastProgressStatus: existing.lastProgressStatus ?? null,
       lastApprovalId: existing.lastApprovalId ?? null,
       terminalNotifiedAt: existing.terminalNotifiedAt ?? null
@@ -77,6 +78,32 @@ export class ManusBridgeStore {
     };
     await this.saveState(state);
     return state.tasks[taskId];
+  }
+
+  async untrackTask(taskId) {
+    const state = await this.loadState();
+    const existing = state.tasks[taskId];
+    if (!existing) {
+      return false;
+    }
+
+    delete state.tasks[taskId];
+
+    const conversation = state.conversations[existing.conversationKey];
+    if (conversation) {
+      conversation.taskIds = conversation.taskIds.filter((value) => value !== taskId);
+      if (conversation.latestTaskId === taskId) {
+        conversation.latestTaskId = conversation.taskIds.at(-1) ?? null;
+      }
+      if (conversation.taskIds.length === 0) {
+        delete state.conversations[existing.conversationKey];
+      } else {
+        state.conversations[existing.conversationKey] = conversation;
+      }
+    }
+
+    await this.saveState(state);
+    return true;
   }
 
   async loadState() {

@@ -11,6 +11,7 @@ import {
 } from "../../core/src";
 import { ModelRouter } from "../../llm/src";
 import {
+  ActionAgent,
   BrowserAgent,
   CodingAgent,
   DocumentAgent,
@@ -366,6 +367,56 @@ test("planner routes direct local pdf text replacement goals to a single coding 
   assert.match(
     plan.steps[0]?.objective ?? "",
     /replace the requested text inside the referenced PDF/i
+  );
+});
+
+test("planner strongly steers approval workflow recipes to document then action", async () => {
+  const planner = new PlannerAgent(new ModelRouter(), undefined, "mock");
+  const plan = await planner.createPlan(
+    "TASK: 整理一条简短中文更新，并在审批后通过 webhook https://example.com/hooks/manus 发送。",
+    { recipeId: "approval_workflow" }
+  );
+
+  assert.deepEqual(
+    plan.steps.map((step) => step.agent),
+    [AgentKind.Document, AgentKind.Action]
+  );
+});
+
+test("action agent infers webhook url from the goal before approval", async () => {
+  const agent = new ActionAgent(
+    {
+      execute: async () => {
+        throw new Error("tool should not execute before approval");
+      }
+    } as unknown as ToolRuntime,
+    new ModelRouter(),
+    "mock"
+  );
+
+  const response = await agent.execute({
+    taskId: "task_approval",
+    stepId: "s2",
+    goal: "整理一条简短中文更新，并在审批后通过 webhook https://example.com/hooks/manus 发送。",
+    context: {},
+    successCriteria: []
+  });
+
+  assert.equal(response.status, "need_approval");
+  assert.equal(response.structuredData?.["action"], "send_webhook");
+  assert.match(response.summary, /example\.com\/hooks\/manus/);
+});
+
+test("planner strongly steers browser data collection recipes to browser then document", async () => {
+  const planner = new PlannerAgent(new ModelRouter(), undefined, "mock");
+  const plan = await planner.createPlan(
+    "TASK: 访问 example.com，抓取标题、正文摘要并保留截图证据，输出 markdown 摘要。",
+    { recipeId: "browser_data_collection" }
+  );
+
+  assert.deepEqual(
+    plan.steps.map((step) => step.agent),
+    [AgentKind.Browser, AgentKind.Document]
   );
 });
 

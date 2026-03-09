@@ -2349,6 +2349,99 @@ const buildSimpleDocumentPlan = (goal: string): Plan => ({
   taskSuccessCriteria: ["Produce the requested output directly"]
 });
 
+const buildApprovalWorkflowPlan = (goal: string): Plan => ({
+  goal,
+  assumptions: [
+    "Prepare the outbound content locally before requesting approval",
+    "Do not execute the external action before approval is granted"
+  ],
+  steps: [
+    {
+      id: "s1",
+      title: "Draft outbound update",
+      agent: AgentKind.Document,
+      objective: "Prepare a short, user-facing update that can be sent through the requested channel",
+      dependsOn: [],
+      inputs: ["goal"],
+      expectedOutput: "Outbound message draft",
+      successCriteria: ["A concise delivery-ready draft exists", "The draft is readable and references the requested goal"]
+    },
+    {
+      id: "s2",
+      title: "Execute approved external action",
+      agent: AgentKind.Action,
+      objective: "Send the prepared update through the requested external channel only after approval",
+      dependsOn: ["s1"],
+      inputs: ["delivery draft", "goal"],
+      expectedOutput: "Delivery receipt",
+      successCriteria: ["An approval request exists", "The external action executes after approval and produces a receipt"]
+    }
+  ],
+  taskSuccessCriteria: ["Produce a delivery draft", "Send the approved external action with a receipt"]
+});
+
+const buildBrowserCollectionPlan = (goal: string): Plan => ({
+  goal,
+  assumptions: [
+    "Capture browser evidence directly from candidate pages",
+    "Summarize the collected evidence into a readable output"
+  ],
+  steps: [
+    {
+      id: "s1",
+      title: "Collect browser evidence",
+      agent: AgentKind.Browser,
+      objective: "Open candidate pages, capture evidence, screenshots, and downloaded artifacts for the requested workflow",
+      dependsOn: [],
+      inputs: ["goal"],
+      expectedOutput: "Structured browser evidence package",
+      successCriteria: ["At least one useful page was inspected", "Evidence points or captures were recorded"]
+    },
+    {
+      id: "s2",
+      title: "Summarize collected evidence",
+      agent: AgentKind.Document,
+      objective: "Summarize the browser evidence, downloads, and captures into a concise user-facing output",
+      dependsOn: ["s1"],
+      inputs: ["browser evidence package"],
+      expectedOutput: "Markdown summary of browser workflow results",
+      successCriteria: ["A readable summary exists", "The summary references the captured evidence or downloads"]
+    }
+  ],
+  taskSuccessCriteria: ["Collect browser evidence", "Produce a readable workflow summary"]
+});
+
+const buildDatasetDeliveryPlan = (goal: string): Plan => ({
+  goal,
+  assumptions: [
+    "Uploaded or inline data should be analyzed locally before drafting the final deliverable",
+    "The final output should package the analysis into a user-facing artifact"
+  ],
+  steps: [
+    {
+      id: "s1",
+      title: "Run local dataset analysis",
+      agent: AgentKind.Coding,
+      objective: "Analyze the uploaded or referenced dataset with local Python and produce structured outputs",
+      dependsOn: [],
+      inputs: ["goal", "uploaded files if present"],
+      expectedOutput: "Structured analysis output",
+      successCriteria: ["A structured analysis artifact exists", "The result can feed a user-facing summary"]
+    },
+    {
+      id: "s2",
+      title: "Generate delivery summary",
+      agent: AgentKind.Document,
+      objective: "Package the dataset findings into a readable markdown summary before any final export",
+      dependsOn: ["s1"],
+      inputs: ["structured analysis output"],
+      expectedOutput: "Markdown delivery summary",
+      successCriteria: ["A markdown summary exists", "The summary references the key findings from the analysis"]
+    }
+  ],
+  taskSuccessCriteria: ["Analyze the dataset", "Produce a delivery-ready summary"]
+});
+
 const buildNextPlanStepId = (steps: Plan["steps"]): string => {
   const lastStepId = steps.at(-1)?.id;
   if (!lastStepId) {
@@ -2620,11 +2713,41 @@ const applyRecipeOverrides = (
   };
 };
 
+const normalizeWorkflowRecipePlan = (
+  goal: string,
+  plan: Plan,
+  recipe?: RecipeDefinition
+): Plan => {
+  if (!recipe) {
+    return plan;
+  }
+
+  if (recipe.id === "approval_workflow" || recipe.id === "email_or_slack_delivery") {
+    return buildApprovalWorkflowPlan(goal);
+  }
+
+  if (recipe.id === "browser_data_collection") {
+    return buildBrowserCollectionPlan(goal);
+  }
+
+  if (recipe.id === "dataset_analysis_delivery") {
+    return buildDatasetDeliveryPlan(goal);
+  }
+
+  if (recipe.id === "pdf_or_docx_export") {
+    return buildSimpleDocumentPlan(goal);
+  }
+
+  return plan;
+};
+
 const sanitizePlannedTask = (goal: string, plan: Plan, recipe?: RecipeDefinition): Plan => {
   const directPdfTextReplacement = isLocalPdfTextReplacementGoal(goal);
   let sanitizedPlan = directPdfTextReplacement
     ? normalizeLocalPdfTextReplacementPlan(goal, plan)
     : normalizePdfExportSteps(goal, plan);
+
+  sanitizedPlan = normalizeWorkflowRecipePlan(goal, sanitizedPlan, recipe);
 
   if (!hasKeyword(goal, SIDE_EFFECT_KEYWORDS)) {
     const hasActionStep = sanitizedPlan.steps.some((step) => step.agent === AgentKind.Action);
@@ -4823,6 +4946,7 @@ export class ActionAgent implements StepAgent {
       approvalStatus === ApprovalStatus.Approved || approvalStatus === ApprovalStatus.Executed;
     const previousStepSummaries = asStringArray(input.context["previousStepSummaries"]);
     const goalAndContext = [input.goal, JSON.stringify(input.context)].join("\n").toLowerCase();
+    const goalUrls = extractHttpUrls([input.goal, ...previousStepSummaries].join("\n"));
     const actionType =
       asOptionalString(input.context["actionType"]) ??
       (EMAIL_KEYWORDS.some((keyword) => goalAndContext.includes(keyword))
@@ -4834,6 +4958,7 @@ export class ActionAgent implements StepAgent {
             : "send_webhook");
     const url =
       asOptionalString(input.context["actionUrl"]) ??
+      (actionType === "send_webhook" ? goalUrls[0] : undefined) ??
       (actionType === "send_slack"
         ? process.env.OPENCLAW_SLACK_WEBHOOK_URL
         : process.env.OPENCLAW_ACTION_WEBHOOK_URL) ??

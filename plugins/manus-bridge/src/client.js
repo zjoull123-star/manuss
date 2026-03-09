@@ -23,7 +23,11 @@ export function createManusClient(apiBaseUrl, fetchImpl = fetch) {
         payload && typeof payload.error === "string"
           ? payload.error
           : `Manus API request failed: HTTP ${response.status}`;
-      throw new Error(message);
+      const error = new Error(message);
+      error.statusCode = response.status;
+      error.payload = payload;
+      error.pathname = pathname;
+      throw error;
     }
 
     return payload;

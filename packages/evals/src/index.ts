@@ -1,11 +1,14 @@
 import path from "node:path";
 import { promises as fs } from "node:fs";
 import {
+  ApprovalStatus,
+  ApprovalRequest,
   ArtifactType,
   BenchmarkRun,
   BenchmarkRunItem,
   BenchmarkRunStatus,
   createDraftTask,
+  getTaskFailureCategory,
   Task,
   TaskStatus
 } from "../../core/src";
@@ -19,6 +22,7 @@ export interface BenchmarkCaseDefinition {
   goal: string;
   recipeId?: string;
   userId?: string;
+  autoApprovePending?: boolean;
   fixtureUploads?: Array<{
     filename: string;
     relativePath: string;
@@ -46,6 +50,10 @@ export interface BenchmarkRuntime {
       metadata: JsonObject;
       createdAt: string;
     }): Promise<unknown>;
+  };
+  approvalRequestRepository: {
+    listByTask(taskId: string): Promise<ApprovalRequest[]>;
+    update(approval: ApprovalRequest): Promise<unknown>;
   };
   benchmarkRunRepository: {
     create(run: BenchmarkRun): Promise<BenchmarkRun>;
@@ -128,6 +136,21 @@ const BENCHMARK_CASES: BenchmarkCaseDefinition[] = [
         contentType: "text/csv"
       }
     ]
+  },
+  {
+    id: "browser_collection_flow",
+    name: "浏览器采集工作流",
+    suite: "smoke",
+    goal: "访问 example.com，抓取标题、正文摘要并保留截图证据，输出 markdown 摘要。",
+    recipeId: "browser_data_collection"
+  },
+  {
+    id: "approval_webhook_delivery",
+    name: "审批后 webhook 交付",
+    suite: "full",
+    goal: "整理一条简短中文更新，并在审批后通过 webhook https://example.com/hooks/manus 发送。",
+    recipeId: "approval_workflow",
+    autoApprovePending: true
   }
 ];
 
@@ -197,12 +220,7 @@ const writeBenchmarkReport = async (
   return { reportPath, baselinePath };
 };
 
-const getFailureCategory = (task: Task): string | undefined => {
-  const failedStep = [...task.steps]
-    .reverse()
-    .find((step) => step.status === "FAILED" || step.status === "RETRYING");
-  return failedStep?.error?.category ?? failedStep?.error?.code;
-};
+const getFailureCategory = (task: Task): string | undefined => getTaskFailureCategory(task);
 
 const createUploadedArtifact = async (
   runtime: BenchmarkRuntime,
@@ -252,6 +270,40 @@ const prepareBenchmarkTask = async (
   }
   await runtime.orchestrator.prepareTaskById(created.id);
   return created;
+};
+
+const executeBenchmarkTask = async (
+  runtime: BenchmarkRuntime,
+  benchmarkCase: BenchmarkCaseDefinition,
+  taskId: string
+): Promise<Task> => {
+  let currentTask = await runtime.orchestrator.runTaskById(taskId);
+  let approvalsResolved = 0;
+
+  while (
+    benchmarkCase.autoApprovePending === true &&
+    currentTask.status === TaskStatus.WaitingApproval &&
+    approvalsResolved < 5
+  ) {
+    const pendingApproval = (await runtime.approvalRequestRepository.listByTask(taskId)).find(
+      (approval) => approval.status === ApprovalStatus.Pending
+    );
+
+    if (!pendingApproval) {
+      break;
+    }
+
+    await runtime.approvalRequestRepository.update({
+      ...pendingApproval,
+      status: ApprovalStatus.Approved,
+      decidedAt: nowIso(),
+      decidedBy: "eval_runner"
+    });
+    approvalsResolved += 1;
+    currentTask = await runtime.orchestrator.resumeTask(taskId);
+  }
+
+  return currentTask;
 };
 
 export const listBenchmarkCases = (): BenchmarkCaseDefinition[] => [...BENCHMARK_CASES];
@@ -327,7 +379,7 @@ export const runBenchmarkSuite = async (
         ...benchmarkCase,
         ...(options.userId ? { userId: options.userId } : {})
       });
-      const finalTask = await runtime.orchestrator.runTaskById(preparedTask.id);
+      const finalTask = await executeBenchmarkTask(runtime, benchmarkCase, preparedTask.id);
       const completed = finalTask.status === TaskStatus.Completed;
       if (completed) {
         completedCount += 1;

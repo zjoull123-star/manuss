@@ -162,9 +162,16 @@ const renderTaskList = () => {
         <article class="task-card ${task.id === state.selectedTaskId ? "active" : ""}" data-task-id="${task.id}">
           <div class="card-title">${escapeHtml(task.goal || task.id)}</div>
           <div class="card-meta">
-            <span class="status-${String(task.status).toLowerCase()}">${escapeHtml(task.status)}</span>
+            <span class="status-${String(task.status).toLowerCase()}">${escapeHtml(task.stageLabel || task.status)}</span>
             <span>${escapeHtml(task.updatedAt || task.createdAt || "-")}</span>
           </div>
+          ${
+            task.failureCategory
+              ? `<p class="muted">failure=${escapeHtml(task.failureCategory)}</p>`
+              : task.stageSummary
+                ? `<p class="muted">${escapeHtml(task.stageSummary)}</p>`
+                : ""
+          }
         </article>
       `
     )
@@ -204,7 +211,7 @@ const renderQualityMetrics = () => {
     return;
   }
 
-  el.qualityMetrics.innerHTML = entries
+  const taskClassCards = entries
     .map(([taskClass, entry]) => {
       const total = Number(entry.total || 0);
       const completed = Number(entry.completed || 0);
@@ -223,6 +230,35 @@ const renderQualityMetrics = () => {
       `;
     })
     .join("");
+
+  const failureCards =
+    Array.isArray(metrics.failureCategories) && metrics.failureCategories.length > 0
+      ? metrics.failureCategories
+          .map(
+            (entry) => `
+              <article class="event-card">
+                <div class="card-title">${escapeHtml(entry.category || "unknown")}</div>
+                <div class="card-meta">
+                  <span>count=${escapeHtml(entry.count || 0)}</span>
+                  <span>taxonomy</span>
+                </div>
+              </article>
+            `
+          )
+          .join("")
+      : `<article class="event-card"><p class="muted">暂无失败分类聚合。</p></article>`;
+
+  el.qualityMetrics.innerHTML = `
+    ${taskClassCards}
+    <article class="event-card">
+      <div class="card-title">browser_blocked</div>
+      <div class="card-meta">
+        <span>count=${escapeHtml(metrics.browserBlockedCount || 0)}</span>
+        <span>signals</span>
+      </div>
+    </article>
+    ${failureCards}
+  `;
 };
 
 const renderSkillManifests = () => {
@@ -726,9 +762,11 @@ const renderSelectedTask = () => {
 
   el.detailEmpty.classList.add("hidden");
   el.detailBody.classList.remove("hidden");
-  el.selectedTaskStatus.textContent = bundle.task.status;
+  el.selectedTaskStatus.textContent = bundle.task.stageLabel || bundle.task.status;
   el.detailTaskId.textContent = bundle.task.id;
-  el.detailGoal.textContent = bundle.task.goal;
+  el.detailGoal.textContent = bundle.task.stageSummary
+    ? `${bundle.task.goal} ｜ ${bundle.task.stageSummary}`
+    : bundle.task.goal;
   el.taskControls.innerHTML = renderTaskControls(bundle.task);
   el.finalArtifactPanel.innerHTML = renderFinalArtifact(bundle.task, bundle.artifacts || []);
   el.finalValidationPanel.innerHTML = renderFinalValidation(bundle.finalArtifactValidation);

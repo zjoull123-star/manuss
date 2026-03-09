@@ -139,6 +139,23 @@ export interface TaskOrigin {
   replyMode: "manual_status" | "auto_callback";
 }
 
+export type TaskStage =
+  | "received"
+  | "planned"
+  | "executing"
+  | "awaiting_approval"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+export interface TaskDeliveryRoute {
+  channel: string;
+  target?: string;
+  accountId?: string;
+  threadId?: string | number;
+  replyMode: TaskOrigin["replyMode"];
+}
+
 export interface TaskStep {
   id: string;
   title: string;
@@ -426,6 +443,184 @@ export const isTerminalTaskStatus = (status: TaskStatus): boolean =>
 
 export const getCompletedStepIds = (task: Task): Set<string> =>
   new Set(task.steps.filter((step) => step.status === StepStatus.Completed).map((step) => step.id));
+
+export const getActiveTaskStep = (task: Task): TaskStep | undefined => {
+  const executingStep = task.steps.find((step) =>
+    [StepStatus.Running, StepStatus.Verifying, StepStatus.WaitingApproval].includes(step.status)
+  );
+  if (executingStep) {
+    return executingStep;
+  }
+
+  return task.steps.find((step) => step.status === StepStatus.Pending);
+};
+
+export const getTaskStage = (task: Task): TaskStage => {
+  switch (task.status) {
+    case TaskStatus.Created:
+      return "received";
+    case TaskStatus.Planned:
+      return "planned";
+    case TaskStatus.WaitingApproval:
+      return "awaiting_approval";
+    case TaskStatus.Completed:
+      return "completed";
+    case TaskStatus.Failed:
+      return "failed";
+    case TaskStatus.Cancelled:
+      return "cancelled";
+    default:
+      return "executing";
+  }
+};
+
+export const getTaskDeliveryRoute = (task: Task): TaskDeliveryRoute | undefined => {
+  if (!task.origin?.channelId) {
+    return undefined;
+  }
+
+  const target = task.origin.conversationId ?? task.origin.senderId;
+  return {
+    channel: task.origin.channelId,
+    ...(target ? { target } : {}),
+    ...(task.origin.accountId ? { accountId: task.origin.accountId } : {}),
+    ...(task.origin.threadId !== undefined ? { threadId: task.origin.threadId } : {}),
+    replyMode: task.origin.replyMode
+  };
+};
+
+const matchesFailurePattern = (value: string | undefined, patterns: RegExp[]): boolean => {
+  if (!value) {
+    return false;
+  }
+  return patterns.some((pattern) => pattern.test(value));
+};
+
+const normalizeFailureText = (value: unknown): string =>
+  typeof value === "string" ? value.trim().toLowerCase() : "";
+
+export const normalizeFailureCategory = (input: {
+  category?: string;
+  code?: ErrorCode;
+  message?: string;
+  taskClass?: TaskClass;
+}): string | undefined => {
+  const rawCategory = normalizeFailureText(input.category);
+  const rawCode = normalizeFailureText(input.code);
+  const rawMessage = normalizeFailureText(input.message);
+  const taskClass = input.taskClass;
+
+  if (
+    matchesFailurePattern(rawCategory, [/^delivery_route$/]) ||
+    matchesFailurePattern(rawMessage, [/channel is required/, /delivery route/, /delivery channel/])
+  ) {
+    return "delivery_route";
+  }
+
+  if (
+    matchesFailurePattern(rawCategory, [/browser_blocked/, /blocked/, /challenge/, /captcha/]) ||
+    (taskClass === TaskClass.ResearchBrowser &&
+      matchesFailurePattern(rawMessage, [
+        /blocked/,
+        /challenge/,
+        /captcha/,
+        /login wall/,
+        /low-substance/,
+        /\b404\b/,
+        /temporarily unavailable/
+      ]))
+  ) {
+    return "browser_blocked";
+  }
+
+  if (
+    matchesFailurePattern(rawCategory, [/insufficient_evidence/, /source coverage/, /timeline evidence/]) ||
+    matchesFailurePattern(rawMessage, [
+      /source coverage below threshold/,
+      /timeline evidence missing/,
+      /missing evidence/,
+      /no findings/,
+      /no candidate urls/
+    ])
+  ) {
+    return "insufficient_evidence";
+  }
+
+  if (
+    matchesFailurePattern(rawCategory, [/tool_timeout/, /timeout/]) ||
+    matchesFailurePattern(rawCode, [/timeout/, /step_timeout/]) ||
+    matchesFailurePattern(rawMessage, [/timed out/, /\btimeout\b/])
+  ) {
+    return "tool_timeout";
+  }
+
+  if (
+    matchesFailurePattern(rawCategory, [/schema_recovery/, /syntax_invalid/, /llm_error/]) ||
+    matchesFailurePattern(rawCode, [/parsing_failed/]) ||
+    matchesFailurePattern(rawMessage, [
+      /invalid json/,
+      /schema mismatch/,
+      /unexpected token/,
+      /unterminated string/,
+      /end of json input/,
+      /syntaxerror/,
+      /json/
+    ])
+  ) {
+    return "schema_recovery";
+  }
+
+  if (
+    matchesFailurePattern(rawCategory, [/approval_waiting/, /approval_rejected/]) ||
+    rawCode === normalizeFailureText(ErrorCode.ApprovalRequired) ||
+    rawCode === normalizeFailureText(ErrorCode.ClarificationRequired) ||
+    matchesFailurePattern(rawMessage, [/waiting approval/, /requires approval/, /approve/])
+  ) {
+    return "approval_waiting";
+  }
+
+  if (
+    taskClass === TaskClass.ActionExecution &&
+    (matchesFailurePattern(rawCategory, [/action_receipt_missing/]) ||
+      matchesFailurePattern(rawMessage, [/receipt/, /delivery receipt/]))
+  ) {
+    return "action_receipt_missing";
+  }
+
+  return rawCategory || rawCode || undefined;
+};
+
+export const getTaskFailureCategory = (task: Task): string | undefined => {
+  if (task.status === TaskStatus.WaitingApproval) {
+    return "approval_waiting";
+  }
+
+  const failedOrActiveStep = [...task.steps]
+    .reverse()
+    .find((step) =>
+      [StepStatus.Failed, StepStatus.WaitingApproval, StepStatus.Retrying, StepStatus.Running].includes(
+        step.status
+      )
+    );
+
+  if (!failedOrActiveStep) {
+    return undefined;
+  }
+
+  return normalizeFailureCategory({
+    ...(failedOrActiveStep.error?.category
+      ? { category: failedOrActiveStep.error.category }
+      : {}),
+    ...(failedOrActiveStep.error?.code ? { code: failedOrActiveStep.error.code } : {}),
+    ...(failedOrActiveStep.error?.upstreamErrorMessage ?? failedOrActiveStep.error?.message
+      ? {
+          message:
+            failedOrActiveStep.error?.upstreamErrorMessage ?? failedOrActiveStep.error?.message
+        }
+      : {}),
+    ...(failedOrActiveStep.taskClass ? { taskClass: failedOrActiveStep.taskClass } : {})
+  });
+};
 
 export interface MemoryRecord {
   id: string;

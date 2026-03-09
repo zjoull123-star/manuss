@@ -16,7 +16,7 @@
     "service:status": "node scripts/manage-launchd.mjs status",
     "service:uninstall": "node scripts/manage-launchd.mjs uninstall",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "OPENCLAW_DB_MODE=inmemory OPENCLAW_AGENT_MODE=mock OPENCLAW_TOOL_MODE=mock OPENCLAW_BROWSER_MODE=mock npm run build && OPENCLAW_DB_MODE=inmemory OPENCLAW_AGENT_MODE=mock OPENCLAW_TOOL_MODE=mock OPENCLAW_BROWSER_MODE=mock node --test dist/packages/agents/test/*.test.js dist/packages/tools/test/*.test.js dist/packages/policy/test/*.test.js dist/packages/orchestrator/test/*.test.js dist/apps/gateway/test/*.test.js",
+    "test": "OPENCLAW_DB_MODE=inmemory OPENCLAW_AGENT_MODE=mock OPENCLAW_TOOL_MODE=mock OPENCLAW_BROWSER_MODE=mock npm run build && OPENCLAW_DB_MODE=inmemory OPENCLAW_AGENT_MODE=mock OPENCLAW_TOOL_MODE=mock OPENCLAW_BROWSER_MODE=mock node --test dist/packages/agents/test/*.test.js dist/packages/tools/test/*.test.js dist/packages/policy/test/*.test.js dist/packages/orchestrator/test/*.test.js dist/packages/recipes/test/*.test.js dist/packages/evals/test/*.test.js dist/apps/gateway/test/*.test.js",
     "dev:worker": "tsx apps/worker/src/index.ts",
     "dev:gateway": "tsx apps/gateway/src/index.ts",
     "dev:api": "tsx apps/api/src/index.ts",

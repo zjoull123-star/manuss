@@ -10,6 +10,9 @@ import {
   ArtifactType,
   createTaskFromPlan,
   createTaskJob,
+  getTaskDeliveryRoute,
+  getTaskFailureCategory,
+  getTaskStage,
   StepStatus,
   TaskClass,
   TaskEventKind,
@@ -582,4 +585,79 @@ test("completed task prefers real deliverables over debug artifacts as final art
     completedTask.finalArtifactUri,
     path.join(workspaceRoot, task.id, "brief.pdf")
   );
+});
+
+test("task helpers derive stage, delivery route, and browser failure taxonomy", () => {
+  const task = createTaskFromPlan(
+    "user_failure_taxonomy",
+    "调研阿联酋香水制造监管要求",
+    {
+      goal: "调研阿联酋香水制造监管要求",
+      assumptions: [],
+      steps: [
+        {
+          id: "s1",
+          title: "Inspect source evidence",
+          agent: AgentKind.Browser,
+          taskClass: TaskClass.ResearchBrowser,
+          objective: "检查来源页面",
+          dependsOn: [],
+          inputs: [],
+          expectedOutput: "source evidence",
+          successCriteria: []
+        }
+      ],
+      taskSuccessCriteria: []
+    },
+    {
+      channelId: "whatsapp",
+      accountId: "default",
+      conversationId: "971500000000",
+      replyMode: "auto_callback"
+    }
+  );
+
+  task.status = TaskStatus.Failed;
+  task.steps[0]!.status = StepStatus.Failed;
+  task.steps[0]!.error = {
+    code: "UNKNOWN" as never,
+    message: "Requested page returned a 404 and no substantive content could be extracted",
+    retryable: false,
+    category: "low_substance_page"
+  };
+
+  assert.equal(getTaskStage(task), "failed");
+  assert.equal(getTaskFailureCategory(task), "browser_blocked");
+  assert.deepEqual(getTaskDeliveryRoute(task), {
+    channel: "whatsapp",
+    accountId: "default",
+    target: "971500000000",
+    replyMode: "auto_callback"
+  });
+});
+
+test("waiting approval tasks normalize to approval_waiting", () => {
+  const task = createTaskFromPlan("user_approval_taxonomy", "发送 Slack 通知", {
+    goal: "发送 Slack 通知",
+    assumptions: [],
+    steps: [
+      {
+        id: "s1",
+        title: "Send notification",
+        agent: AgentKind.Action,
+        taskClass: TaskClass.ActionExecution,
+        objective: "发送通知",
+        dependsOn: [],
+        inputs: [],
+        expectedOutput: "delivery receipt",
+        successCriteria: []
+      }
+    ],
+    taskSuccessCriteria: []
+  });
+  task.status = TaskStatus.WaitingApproval;
+  task.steps[0]!.status = StepStatus.WaitingApproval;
+
+  assert.equal(getTaskStage(task), "awaiting_approval");
+  assert.equal(getTaskFailureCategory(task), "approval_waiting");
 });

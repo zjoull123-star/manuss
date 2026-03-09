@@ -8,6 +8,10 @@ import {
   BenchmarkRunStatus,
   createTaskEvent,
   createTaskJob,
+  getTaskDeliveryRoute,
+  getTaskFailureCategory,
+  getTaskStage,
+  normalizeFailureCategory,
   TaskEventKind,
   TaskOrigin,
   TaskJobKind,
@@ -148,6 +152,101 @@ const isPathInside = (rootDir: string, candidatePath: string): boolean => {
 const taskWorkspaceRoot = (taskId: string): string =>
   path.resolve(runtime.workspaceRoot, taskId);
 
+const STAGE_LABELS: Record<string, string> = {
+  received: "已接收",
+  planned: "已规划",
+  executing: "执行中",
+  awaiting_approval: "等待审批",
+  completed: "已完成",
+  failed: "已失败",
+  cancelled: "已取消"
+};
+
+type TaskStepSummaryShape = {
+  id?: string;
+  title?: string;
+  agent?: string;
+  status?: string;
+};
+
+type TaskSummaryShape = {
+  id: string;
+  userId?: string;
+  goal?: string;
+  recipeId?: string;
+  status: string;
+  createdAt?: string;
+  updatedAt?: string;
+  finalArtifactUri?: string;
+  finalArtifactValidation?: unknown;
+  origin?: TaskOrigin;
+  retryOfTaskId?: string;
+  cancelRequestedAt?: string;
+  steps?: TaskStepSummaryShape[];
+};
+
+const summarizeTaskStage = (task: {
+  status: string;
+  steps?: TaskStepSummaryShape[];
+  finalArtifactUri?: string;
+  failureCategory?: string | null;
+}) => {
+  const stage = getTaskStage(task as never);
+  const activeStep = Array.isArray(task.steps)
+    ? task.steps.find((step) => {
+        if (!step || typeof step !== "object") {
+          return false;
+        }
+        const status = String((step as Record<string, unknown>)["status"] ?? "");
+        return ["RUNNING", "VERIFYING", "WAITING_APPROVAL", "PENDING", "RETRYING"].includes(status);
+      })
+    : undefined;
+  const activeStepId =
+    activeStep && typeof activeStep["id"] === "string" ? activeStep["id"] : null;
+  const activeStepTitle =
+    activeStep && typeof activeStep["title"] === "string" ? activeStep["title"] : null;
+  const activeStepAgent =
+    activeStep && typeof activeStep["agent"] === "string" ? activeStep["agent"] : null;
+
+  let stageSummary = `任务当前状态：${task.status}`;
+  switch (stage) {
+    case "received":
+      stageSummary = "任务已接收，正在进入规划队列。";
+      break;
+    case "planned":
+      stageSummary = "任务已规划，准备开始执行。";
+      break;
+    case "executing":
+      stageSummary = activeStepTitle
+        ? `当前执行：${activeStepTitle}${activeStepAgent ? ` (${activeStepAgent})` : ""}。`
+        : "任务正在执行中。";
+      break;
+    case "awaiting_approval":
+      stageSummary = activeStepTitle ? `当前步骤等待审批：${activeStepTitle}。` : "任务正在等待审批。";
+      break;
+    case "completed":
+      stageSummary = task.finalArtifactUri ? "任务已完成，最终交付物已生成。" : "任务已完成。";
+      break;
+    case "failed":
+      stageSummary = task.failureCategory
+        ? `任务执行失败，类别：${task.failureCategory}。`
+        : "任务执行失败。";
+      break;
+    case "cancelled":
+      stageSummary = "任务已取消。";
+      break;
+  }
+
+  return {
+    stage,
+    stageLabel: STAGE_LABELS[stage] ?? stage,
+    stageSummary,
+    activeStepId,
+    activeStepTitle,
+    activeStepAgent
+  };
+};
+
 const summarizeTask = (task: {
   id: string;
   userId?: string;
@@ -161,20 +260,36 @@ const summarizeTask = (task: {
   origin?: TaskOrigin;
   retryOfTaskId?: string;
   cancelRequestedAt?: string;
-}): Record<string, unknown> => ({
-  id: task.id,
-  ...(task.userId ? { userId: task.userId } : {}),
-  ...(task.goal ? { goal: task.goal } : {}),
-  ...(task.recipeId ? { recipeId: task.recipeId } : {}),
-  status: task.status,
-  ...(task.createdAt ? { createdAt: task.createdAt } : {}),
-  ...(task.updatedAt ? { updatedAt: task.updatedAt } : {}),
-  finalArtifactUri: task.finalArtifactUri ?? null,
-  finalArtifactValidation: task.finalArtifactValidation ?? null,
-  origin: task.origin ?? null,
-  retryOfTaskId: task.retryOfTaskId ?? null,
-  cancelRequestedAt: task.cancelRequestedAt ?? null
-});
+  steps?: TaskStepSummaryShape[];
+}): Record<string, unknown> => {
+  const failureCategory = getTaskFailureCategory(task as never) ?? null;
+  const stage = summarizeTaskStage({
+    ...task,
+    failureCategory
+  });
+  return {
+    id: task.id,
+    ...(task.userId ? { userId: task.userId } : {}),
+    ...(task.goal ? { goal: task.goal } : {}),
+    ...(task.recipeId ? { recipeId: task.recipeId } : {}),
+    status: task.status,
+    stage: stage.stage,
+    stageLabel: stage.stageLabel,
+    stageSummary: stage.stageSummary,
+    activeStepId: stage.activeStepId,
+    activeStepTitle: stage.activeStepTitle,
+    activeStepAgent: stage.activeStepAgent,
+    failureCategory,
+    deliveryRoute: getTaskDeliveryRoute(task as never) ?? null,
+    ...(task.createdAt ? { createdAt: task.createdAt } : {}),
+    ...(task.updatedAt ? { updatedAt: task.updatedAt } : {}),
+    finalArtifactUri: task.finalArtifactUri ?? null,
+    finalArtifactValidation: task.finalArtifactValidation ?? null,
+    origin: task.origin ?? null,
+    retryOfTaskId: task.retryOfTaskId ?? null,
+    cancelRequestedAt: task.cancelRequestedAt ?? null
+  };
+};
 
 const isPendingApproval = (status: string): boolean => status === ApprovalStatus.Pending;
 
@@ -208,12 +323,37 @@ const summarizeStepError = (step: Record<string, unknown>): Record<string, unkno
         : typeof structuredData["stage"] === "string"
           ? structuredData["stage"]
           : null,
-    category:
+    rawCategory:
       typeof rawError["category"] === "string"
         ? rawError["category"]
         : typeof structuredData["category"] === "string"
           ? structuredData["category"]
           : null,
+    category: (() => {
+      const category =
+        typeof rawError["category"] === "string"
+          ? rawError["category"]
+          : typeof structuredData["category"] === "string"
+            ? structuredData["category"]
+            : undefined;
+      const code = typeof rawError["code"] === "string" ? (rawError["code"] as never) : undefined;
+      const message =
+        typeof rawError["upstreamErrorMessage"] === "string"
+          ? rawError["upstreamErrorMessage"]
+          : typeof rawError["message"] === "string"
+            ? rawError["message"]
+            : undefined;
+      const taskClass =
+        typeof step["taskClass"] === "string" ? (step["taskClass"] as never) : undefined;
+      return (
+        normalizeFailureCategory({
+          ...(category ? { category } : {}),
+          ...(code ? { code } : {}),
+          ...(message ? { message } : {}),
+          ...(taskClass ? { taskClass } : {})
+        }) ?? null
+      );
+    })(),
     upstreamErrorMessage:
       typeof rawError["upstreamErrorMessage"] === "string"
         ? rawError["upstreamErrorMessage"]
@@ -241,6 +381,7 @@ const summarizeStepError = (step: Record<string, unknown>): Record<string, unkno
 
 const summarizeTaskForApi = (task: Record<string, unknown>): Record<string, unknown> => ({
   ...task,
+  ...summarizeTask(task as TaskSummaryShape),
   steps: Array.isArray(task["steps"])
     ? task["steps"].map((candidate) => {
         const step =
@@ -464,7 +605,13 @@ const buildTaskBundle = async (taskId: string): Promise<Record<string, unknown> 
 const buildQualityMetrics = async (): Promise<Record<string, unknown>> => {
   const tasks = await runtime.taskRepository.listRecent(200);
   const grouped = new Map<string, { total: number; completed: number; failed: number; fallbackUsed: number }>();
+  const failureCategories = new Map<string, number>();
+  let browserBlockedCount = 0;
   for (const task of tasks) {
+    const taskFailureCategory = getTaskFailureCategory(task);
+    if (taskFailureCategory) {
+      failureCategories.set(taskFailureCategory, (failureCategories.get(taskFailureCategory) ?? 0) + 1);
+    }
     for (const step of task.steps) {
       const taskClass = step.taskClass ?? "unknown";
       const entry = grouped.get(taskClass) ?? { total: 0, completed: 0, failed: 0, fallbackUsed: 0 };
@@ -478,6 +625,17 @@ const buildQualityMetrics = async (): Promise<Record<string, unknown>> => {
       if (step.error?.fallbackUsed === true || step.structuredData?.llmFallbackUsed === true || step.structuredData?.synthesisFallbackUsed === true) {
         entry.fallbackUsed += 1;
       }
+      const normalizedCategory = normalizeFailureCategory({
+        ...(step.error?.category ? { category: step.error.category } : {}),
+        ...(step.error?.code ? { code: step.error.code } : {}),
+        ...(step.error?.upstreamErrorMessage ?? step.error?.message
+          ? { message: step.error?.upstreamErrorMessage ?? step.error?.message }
+          : {}),
+        ...(step.taskClass ? { taskClass: step.taskClass } : {})
+      });
+      if (normalizedCategory === "browser_blocked") {
+        browserBlockedCount += 1;
+      }
       grouped.set(taskClass, entry);
     }
   }
@@ -487,7 +645,11 @@ const buildQualityMetrics = async (): Promise<Record<string, unknown>> => {
       taskClass,
       ...metrics,
       completionRate: metrics.total > 0 ? metrics.completed / metrics.total : 0
-    }))
+    })),
+    failureCategories: [...failureCategories.entries()]
+      .map(([category, count]) => ({ category, count }))
+      .sort((left, right) => right.count - left.count),
+    browserBlockedCount
   };
 };
 
@@ -558,7 +720,7 @@ const handleDecision = async (
 
   sendJson(response, 200, {
     approval: updatedApproval,
-    task: task ? summarizeTask(task) : null,
+    task: task ? summarizeTask(task as TaskSummaryShape) : null,
     job
   });
 };
