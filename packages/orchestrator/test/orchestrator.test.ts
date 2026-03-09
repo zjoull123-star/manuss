@@ -80,7 +80,8 @@ test("approval-gated action step pauses and resumes after approval", async () =>
 
     const waitingTask = await runtime.orchestrator.handleGoal({
       userId: "user_approval",
-      goal: "帮我调研迪拜新能源租车市场，生成报告后通过 webhook 通知我"
+      goal: "整理一条简短中文更新，并在审批后通过 webhook https://example.test/webhook 发送。",
+      recipeId: "approval_workflow"
     });
 
     assert.equal(waitingTask.status, TaskStatus.WaitingApproval);
@@ -131,7 +132,8 @@ test("queue worker consumes execute and resume jobs end-to-end", async () => {
 
     const task = await runtime.orchestrator.prepareTask({
       userId: "user_queue",
-      goal: "帮我调研迪拜新能源租车市场，生成报告后通过 webhook 通知我"
+      goal: "整理一条简短中文更新，并在审批后通过 webhook https://example.test/webhook 发送。",
+      recipeId: "approval_workflow"
     });
     const executeJob = await runtime.taskJobRepository.enqueue(
       createTaskJob(task.id, TaskJobKind.ExecuteTask)

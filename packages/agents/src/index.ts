@@ -2442,6 +2442,118 @@ const buildDatasetDeliveryPlan = (goal: string): Plan => ({
   taskSuccessCriteria: ["Analyze the dataset", "Produce a delivery-ready summary"]
 });
 
+const buildWideResearchPlan = (
+  goal: string,
+  options: {
+    researchTitle: string;
+    researchObjective: string;
+    browserTitle: string;
+    browserObjective: string;
+    documentTitle: string;
+    documentObjective: string;
+    taskSuccessCriteria: string[];
+  }
+): Plan => ({
+  goal,
+  assumptions: [
+    "Collect broad evidence first, then inspect a focused subset of authoritative sources in the browser.",
+    "Only draft the final deliverable after research and browser evidence have been collected."
+  ],
+  steps: [
+    {
+      id: "s1",
+      title: options.researchTitle,
+      agent: AgentKind.Research,
+      objective: options.researchObjective,
+      dependsOn: [],
+      inputs: ["goal"],
+      expectedOutput: "Structured research evidence package with source coverage.",
+      successCriteria: [
+        "At least three relevant sources or evidence points are collected",
+        "Structured findings and source references are available for downstream steps"
+      ]
+    },
+    {
+      id: "s2",
+      title: options.browserTitle,
+      agent: AgentKind.Browser,
+      objective: options.browserObjective,
+      dependsOn: ["s1"],
+      inputs: ["research evidence package", "candidate source urls"],
+      expectedOutput: "Browser-verified evidence package with screenshots or extracted page content.",
+      successCriteria: [
+        "At least one authoritative or useful page is inspected",
+        "Browser evidence extends or validates the research evidence"
+      ]
+    },
+    {
+      id: "s3",
+      title: options.documentTitle,
+      agent: AgentKind.Document,
+      objective: options.documentObjective,
+      dependsOn: ["s1", "s2"],
+      inputs: ["research evidence package", "browser evidence package"],
+      expectedOutput: "User-facing markdown brief or report.",
+      successCriteria: [
+        "The document cites the collected evidence",
+        "The document is readable and aligned with the requested deliverable"
+      ]
+    }
+  ],
+  taskSuccessCriteria: options.taskSuccessCriteria
+});
+
+const buildFeasibilityResearchPlan = (goal: string): Plan =>
+  buildWideResearchPlan(goal, {
+    researchTitle: "Collect feasibility evidence",
+    researchObjective:
+      "Collect regulatory, setup-path, cost, supply-chain, channel, timeline, and risk evidence for the requested feasibility task.",
+    browserTitle: "Inspect source evidence",
+    browserObjective:
+      "Inspect the most relevant source pages, validate key claims, and capture browser evidence for the feasibility task.",
+    documentTitle: "Draft feasibility report",
+    documentObjective:
+      "Draft an evidence-backed feasibility report in the requested language and structure using the collected research and browser evidence.",
+    taskSuccessCriteria: [
+      "Collect evidence for regulation, setup path, cost, supply chain, channels, timeline, and risks",
+      "Produce an executable feasibility report"
+    ]
+  });
+
+const buildTimelineBriefPlan = (goal: string): Plan =>
+  buildWideResearchPlan(goal, {
+    researchTitle: "Collect latest developments and timeline evidence",
+    researchObjective:
+      "Collect the latest developments, source references, and timeline-ready evidence for the requested brief.",
+    browserTitle: "Inspect source evidence",
+    browserObjective:
+      "Inspect authoritative pages, confirm timeline evidence, and capture browser evidence for the requested brief.",
+    documentTitle: "Draft timeline brief",
+    documentObjective:
+      "Draft a concise, evidence-backed brief with timeline, risks, and sources in the requested language.",
+    taskSuccessCriteria: [
+      "Collect enough evidence to support a timeline brief",
+      "Produce a readable brief with sources and timeline coverage"
+    ]
+  });
+
+const buildMarketResearchPlan = (goal: string): Plan =>
+  buildWideResearchPlan(goal, {
+    researchTitle: "Collect market evidence",
+    researchObjective:
+      "Collect market landscape, competitor, pricing, channel, and risk evidence for the requested research task.",
+    browserTitle: "Inspect source evidence",
+    browserObjective:
+      "Inspect selected source pages to confirm competitor, pricing, and channel evidence for the requested market research.",
+    documentTitle: "Draft market research report",
+    documentObjective:
+      "Draft a market research report using the collected research and browser evidence in the requested format.",
+    taskSuccessCriteria: [
+      "Collect competitor, pricing, channel, and risk evidence",
+      "Produce a readable market research report"
+    ]
+  });
+
 const buildNextPlanStepId = (steps: Plan["steps"]): string => {
   const lastStepId = steps.at(-1)?.id;
   if (!lastStepId) {
@@ -2736,6 +2848,18 @@ const normalizeWorkflowRecipePlan = (
 
   if (recipe.id === "pdf_or_docx_export") {
     return buildSimpleDocumentPlan(goal);
+  }
+
+  if (recipe.id === "feasibility_report") {
+    return buildFeasibilityResearchPlan(goal);
+  }
+
+  if (recipe.id === "timeline_brief") {
+    return buildTimelineBriefPlan(goal);
+  }
+
+  if (recipe.id === "market_research") {
+    return buildMarketResearchPlan(goal);
   }
 
   return plan;

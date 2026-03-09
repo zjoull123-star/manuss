@@ -83,7 +83,7 @@ test("planner fallback keeps non-market goals goal-aware", async () => {
     {}
   );
 
-  assert.match(plan.steps[0]?.objective ?? "", /伊朗战情简报/);
+  assert.match(plan.steps[0]?.objective ?? "", /latest developments|最新/);
   assert.equal(plan.steps[0]?.agent, AgentKind.Research);
 });
 
@@ -240,11 +240,13 @@ test("planner appends a coding pdf export step when the goal requires pdf output
     {}
   );
 
-  assert.equal(plan.steps.length, 3);
-  assert.equal(plan.steps[2]?.agent, AgentKind.Coding);
-  assert.equal(plan.steps[2]?.id, "S3");
-  assert.deepEqual(plan.steps[2]?.dependsOn, ["S2"]);
-  assert.match(plan.steps[2]?.objective ?? "", /PDF/);
+  assert.equal(plan.steps.length, 4);
+  assert.deepEqual(
+    plan.steps.map((step) => step.agent),
+    [AgentKind.Research, AgentKind.Browser, AgentKind.Document, AgentKind.Coding]
+  );
+  assert.deepEqual(plan.steps[3]?.dependsOn, [plan.steps[2]?.id]);
+  assert.match(plan.steps[3]?.objective ?? "", /PDF/);
   assert.equal(plan.taskSuccessCriteria.includes("最终输出为可打开的 PDF 文件"), true);
 });
 
@@ -418,6 +420,39 @@ test("planner strongly steers browser data collection recipes to browser then do
     plan.steps.map((step) => step.agent),
     [AgentKind.Browser, AgentKind.Document]
   );
+});
+
+test("planner strongly steers timeline brief recipes to research -> browser -> document -> pdf", async () => {
+  const planner = new PlannerAgent(new ModelRouter(), undefined, "mock");
+  const plan = await planner.createPlan(
+    "TASK: 做一个关于伊朗战争的最新简报带时间轴，输出 pdf",
+    { recipeId: "timeline_brief" }
+  );
+
+  assert.deepEqual(
+    plan.steps.map((step) => step.agent),
+    [AgentKind.Research, AgentKind.Browser, AgentKind.Document, AgentKind.Coding]
+  );
+  assert.equal(plan.steps[0]?.taskClass, TaskClass.ResearchBrowser);
+  assert.equal(plan.steps[1]?.taskClass, TaskClass.ResearchBrowser);
+  assert.equal(plan.steps[2]?.taskClass, TaskClass.DocumentExport);
+  assert.equal(plan.steps[3]?.taskClass, TaskClass.CodingPython);
+});
+
+test("planner strongly steers feasibility recipes to research -> browser -> document", async () => {
+  const planner = new PlannerAgent(new ModelRouter(), undefined, "mock");
+  const plan = await planner.createPlan(
+    "TASK: 调研在阿联酋开设香水制造公司的可行性与落地路径，输出可执行报告。",
+    { recipeId: "feasibility_report" }
+  );
+
+  assert.deepEqual(
+    plan.steps.map((step) => step.agent),
+    [AgentKind.Research, AgentKind.Browser, AgentKind.Document]
+  );
+  assert.equal(plan.steps[0]?.taskClass, TaskClass.WideResearch);
+  assert.equal(plan.steps[1]?.taskClass, TaskClass.WideResearch);
+  assert.equal(plan.steps[2]?.taskClass, TaskClass.DocumentExport);
 });
 
 test("browser agent falls back to the next candidate when the first page is blocked", async () => {

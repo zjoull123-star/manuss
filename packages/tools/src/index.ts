@@ -458,6 +458,66 @@ const buildBrowserOutput = (base: {
   ...(typeof base.extractedText === "string" ? { extractedText: base.extractedText } : {})
 });
 
+const buildMockSearchResults = (
+  query: string
+): Array<{ title: string; url: string; snippet: string }> => {
+  const normalized = query.toLowerCase();
+  const isTimelineConflictQuery =
+    /(iran|israel|war|conflict|timeline|brief|战情|战争|冲突|时间线|时间轴|简报)/i.test(normalized);
+
+  if (isTimelineConflictQuery) {
+    return [
+      {
+        title: "Reuters conflict update - 2026-03-07",
+        url: "https://www.reuters.com/world/middle-east/mock-iran-update-2026-03-07",
+        snippet:
+          "2026-03-07: Reuters reports a new escalation, missile exchanges, and diplomatic warnings tied to the Iran conflict."
+      },
+      {
+        title: "UN briefing note - 2026-03-06",
+        url: "https://www.un.org/mock-briefing/iran-conflict-2026-03-06",
+        snippet:
+          "2026-03-06: UN officials describe humanitarian risks, regional security concerns, and an updated conflict timeline."
+      },
+      {
+        title: "Associated Press regional update - 2026-03-05",
+        url: "https://apnews.com/mock/iran-conflict-2026-03-05",
+        snippet:
+          "2026-03-05: AP summarizes retaliatory strikes, civilian impact, and the latest cross-border developments."
+      },
+      {
+        title: "Official foreign ministry statement - 2026-03-04",
+        url: "https://www.state.gov/mock/iran-conflict-2026-03-04",
+        snippet:
+          "2026-03-04: An official statement outlines negotiation status, escalation risks, and the latest timeline markers."
+      }
+    ];
+  }
+
+  return [
+    {
+      title: "Mock competitor profile",
+      url: "https://example.com/mock-competitor",
+      snippet: `Synthetic search result for ${query}`
+    },
+    {
+      title: "Regional market overview",
+      url: "https://market.example/regional-overview",
+      snippet: `Regional market overview and demand signals related to ${query}`
+    },
+    {
+      title: "Official guidance",
+      url: "https://gov.example/official-guidance",
+      snippet: `Official guidance and regulatory considerations relevant to ${query}`
+    },
+    {
+      title: "Industry setup playbook",
+      url: "https://industry.example/setup-playbook",
+      snippet: `Industry setup, licensing, and operational guidance related to ${query}`
+    }
+  ];
+};
+
 export class SearchTool implements Tool {
   readonly name = ToolName.Search;
 
@@ -470,33 +530,13 @@ export class SearchTool implements Tool {
     const query = asString(request.input["query"], request.taskId);
 
     if (this.options.mode !== "live" || !this.llmClient.isConfigured()) {
+      const mockResults = buildMockSearchResults(query);
       return {
         status: "success",
         summary: `Collected mock web results for query: ${query}`,
         output: {
           answer: `Synthetic search answer for ${query}`,
-          results: [
-            {
-              title: "Mock competitor profile",
-              url: "https://example.com/mock-competitor",
-              snippet: `Synthetic search result for ${query}`
-            },
-            {
-              title: "Regional market overview",
-              url: "https://market.example/regional-overview",
-              snippet: `Regional market overview and demand signals related to ${query}`
-            },
-            {
-              title: "Official guidance",
-              url: "https://gov.example/official-guidance",
-              snippet: `Official guidance and regulatory considerations relevant to ${query}`
-            },
-            {
-              title: "Industry setup playbook",
-              url: "https://industry.example/setup-playbook",
-              snippet: `Industry setup, licensing, and operational guidance related to ${query}`
-            }
-          ]
+          results: mockResults
         },
         metrics: {
           durationMs: 5

@@ -37,6 +37,38 @@ test("search tool mock mode returns enough sources for feasibility-style baselin
   assert.equal(results.length >= 4, true);
 });
 
+test("search tool mock mode returns dated sources for timeline-style baselines", async () => {
+  const tool = new SearchTool(
+    {
+      isConfigured: () => false
+    } as never,
+    {
+      mode: "mock"
+    }
+  );
+
+  const response = await tool.execute({
+    taskId: "task_search_timeline_mock",
+    stepId: "s1",
+    toolName: ToolName.Search,
+    action: "search_web",
+    callerAgent: AgentKind.Research,
+    input: {
+      query: "Iran conflict latest brief with timeline"
+    }
+  });
+
+  assert.equal(response.status, "success");
+  const results = (
+    Array.isArray(response.output?.results) ? response.output.results : []
+  ) as Array<{ snippet?: string }>;
+  assert.equal(results.length >= 4, true);
+  assert.equal(
+    results.every((result) => /\b2026-03-0[4-7]\b/.test(String(result?.snippet ?? ""))),
+    true
+  );
+});
+
 test("python tool executes a local script and captures generated files", async () => {
   const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-manus-python-"));
   const tool = new PythonTool(new WorkspaceManager(workspaceRoot), {
